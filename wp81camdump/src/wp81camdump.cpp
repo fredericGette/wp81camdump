@@ -77,7 +77,8 @@ static void PrintUsage()
 	printf("  -c <n>     With -r: take <n> raw stills in the same session (<name>_1.raw, ...)\n");
 	printf("  -g         With -r: first a throwaway still in the largest raw type, to make the driver reallocate\n");
 	printf("             its raw buffer (only the first camera session after boot gets raw data otherwise)\n");
-	printf("  -e <time>  Exposure time in seconds: 1/125, 0.5, ... up to 4, or auto (default: auto)\n");
+	printf("  -e <time>  Exposure time in seconds: 1/125, 0.5, ... or auto (default: auto)\n");
+	printf("             Up to 4 s (4000 ms), or up to 6.428 s (6428 ms) with -r\n");
 	printf("             Sets HKLM\\Software\\OEM\\Nokia\\Camera\\RFC\\Caps MaxET = 4000000 (the 1 s default limit -> 4 s)\n");
 	printf("  -i <iso>   ISO speed: 100, 800, ... or auto (default: auto)\n");
 	printf("             With -r, -e and -i are written to the sensor itself: exposure, and analog gain = ISO / 100\n");
@@ -413,6 +414,9 @@ static void FormatSubtype(const GUID &g, char *out, size_t size);
 // subtypes), there's no Bayer decoder, IMFSourceReader::SetCurrentMediaType fails with MF_E_TOPO_CODEC_NOT_FOUND
 // and the whole initialization of MediaCapture fails. So SetCurrentMediaType is hooked: when it fails on a stream
 // whose first native type is Bayer, the native type is set instead (no conversion).
+// The source reader is created by MFCreateSourceReaderFromMediaSource, a delay-load import of MFCaptureEngine.dll: that
+// import is hooked to reach the reader. In PT mode the still pin (stream 3) offers the vendor subtype
+// {009D4DF4-0A60-4020-A779-A67611E7684A} (ideal raw, several sizes) plus 2 MIPI types at 41 MP.
 #define SOURCE_READER_SET_CURRENT_MEDIA_TYPE_INDEX 7
 typedef HRESULT(STDMETHODCALLTYPE *SetCurrentMediaTypeFn)(IMFSourceReader *reader, DWORD streamIndex,
 	DWORD *reserved, IMFMediaType *mediaType);
@@ -1009,6 +1013,11 @@ static void RestoreDeviceMediaType(IMFCaptureSource_ *source, DWORD stream, IMFM
 // Finds the ideal-raw type (vendor subtype of the PT still pin) with the largest sample size. Used by -g:
 // a still in that type makes MultiPass::CreateIdealRawHeap reallocate its heap (it reuses the heap kept from the
 // previous camera session when it's big enough, and then the raw frames come back filled with zeros).
+// Seen on one boot, after development runs that had crashed: after the first camera session every raw still was a
+// buffer of the right size filled with zeros, although the driver trace showed the VFE writing the frame each time
+// (same buffer, device address 0xf07000). The heap is freed only when its cached size (+0x118) is 0. A still in the
+// largest ideal-raw type (5376x3744) fixed it. Not seen again on the 4 clean boots that followed, even when replaying
+// that boot's sequence (raw -> reset -> JPEG -> raw). Within one session, several stills (-c) all work.
 static BOOL FindLargestIdealRawType(int *streamOut, int *typeOut)
 {
 	static const GUID idealRaw = { 0x009D4DF4, 0x0A60, 0x4020, { 0xA7, 0x79, 0xA6, 0x76, 0x11, 0xE7, 0x68, 0x4A } };
@@ -1041,6 +1050,9 @@ static BOOL FindLargestIdealRawType(int *streamOut, int *typeOut)
 // CameraDiagnostics property set of qccamavs8930.sys (CameraDiagnostics::ControlCamera), only in manufacturing mode:
 // 5 = EXPOSURE_TIME (ULONG µs), 7 = GAIN_AND_EXPOSURE (ULONG µs + USHORT analog gain Q8). The setters write the sensor
 // directly (sensor ioctl 0x43), without the 3A, then wait one frame interval (max 200 ms).
+// Measured on the Lumia 520 (mean above black level): 0.1 s -> 2.0, 1 s -> 21.7, 4 s -> 88.8 (linear); analog gain
+// 1x -> 8x -> 16x gives x8 then x2. The sensor accepted gains up to 16x. The 4 s cap of the 3A (NokiaElfsPlugIn)
+// doesn't apply on this path: the limit is the sensor's 65535 lines (6428 ms, see ApplyRawExposure).
 static const GUID PROPSETID_CAMERA_DIAGNOSTIC_ = { 0x2ed26bd2, 0x811f, 0x42e8, { 0xa8, 0x1a, 0x91, 0x99, 0xac, 0xe1, 0x9d, 0x36 } };
 #define KSPROPERTY_CAMERA_DIAGNOSTIC_GAIN_AND_EXPOSURE_ 7
 
@@ -1077,6 +1089,7 @@ static HRESULT SensorGainAndExposure(BOOL set, DWORD *exposureUs, DWORD *gainQ8)
 
 // -r: writes rawExposureUs/rawGainQ8 to the sensor (the -e/-i of the normal path don't reach it: the raw still is taken
 // with the sensor settings of manufacturing mode), then reads the values back for the .txt.
+// Without -e/-i the still keeps whatever the 3A last set (66 ms, 8x in a dark room).
 static void ApplyRawExposure()
 {
 	DWORD exposureUs = 0, gainQ8 = 0;
@@ -1301,6 +1314,17 @@ static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int 
 				// output (rawOutputFormat 21 in the driver trace): Qualcomm packed 10-bit (6 pixels in 8 bytes),
 				// rows of ceil(width / 6) * 8 bytes, Bayer order GBRG (sensor GRBG + flip + mirror). Checked on
 				// a 2592x1944 frame: 1948 rows of image, then other data.
+				// Ideal raw = the sensor's Bayer mosaic after the first VFE corrections (black level, lens shading,
+				// bad pixels), before demosaic, white balance, colour matrix, noise reduction and sharpening. It's not
+				// the untouched sensor data (that would be the RDI path). Driver trace for 2592x1944: rowIncrement 432
+				// (x 8 = 3456 bytes per row), linesPerImage 1947, buffer of 6,928,416 bytes. Black level 64. The SMIA
+				// order of the sensor is GRBG, the driver enables flip + mirror: GBRG, checked against a JPEG of the
+				// same scene. The picture is rotated 90°, as the sensor is mounted.
+				// Driver trace: HKLM\System\CurrentControlSet\Services\qccamavs\Tracing TraceEnable = 1 and
+				// CoreDbgEnable = 1, reboot, then record provider {62774a98-5c63-43e1-8b13-3c5e8958e414} with
+				// "tracelog -start ... -f x.etl" and "tracelog -enableex ... -level 5 -matchanykw 0xFFFFFFFFFFFFFFFF".
+				// The events are ASCII strings (tracerpt shows them as BinaryEventData). Only the VFE core and the
+				// sensor log there, not the AVStream layer.
 				static const GUID idealRaw = { 0x009D4DF4, 0x0A60, 0x4020, { 0xA7, 0x79, 0xA6, 0x76, 0x11, 0xE7, 0x68, 0x4A } };
 				char fourcc[5] = "";
 				const char *order = "";
@@ -1411,6 +1435,7 @@ static BOOL SameAspectRatio(UINT32 w1, UINT32 h1, UINT32 w2, UINT32 h2)
 
 
 // Lists the picture (JPEG) resolutions, for -s.
+// On the Lumia 520: 2592x1936, 2048x1536, 640x480 (4:3), 2592x1456, 1280x720 (16:9).
 static void PrintPhotoResolutions(WMC::IMediaCapture *capture)
 {
 	ComPtr<WMD::IVideoDeviceController> videoController;
@@ -1534,7 +1559,8 @@ static HRESULT SelectLargestResolution(WMD::IMediaDeviceController *controller, 
 }
 
 // Starts a preview to the preview sink of VideoSink_RT.dll, so the camera streams
-// (and the 3A algorithms converge) without any UI.
+// (and the 3A algorithms converge) without any UI. Without a preview (-n) the picture is black on the Lumia 520.
+// The preview is the largest resolution with the aspect ratio of the photo (1024x768 for 2592x1936).
 static HRESULT StartPreview(WMC::IMediaCapture *capture, WMD::IMediaDeviceController *controller)
 {
 	// The sensor keeps the field of view of the preview for the photo: a 16:9 preview gives
@@ -1625,6 +1651,12 @@ static void PrintIsoPresets(WMD::IIsoSpeedControl *control)
 
 // Sets the exposure time (100 ns units) and the ISO speed. -1 = keep as is, 0 = auto.
 // Failures are warnings: the picture is still taken, and the applied values are printed.
+// Done once the preview runs, so focus and white balance still settle during the delay. Ranges on the Lumia 520:
+// 0.06 ms to 1 s, ISO 100 to 1600. They are defaults of qccamavs8930.sys (CaptureFilter13MP), which reads MinET/MaxET
+// (µs) and MinIso/MaxIso from HKLM\Software\OEM\Nokia\Camera\RFC\Caps at each camera open. MFCaptureEngine
+// rejects a value outside the reported range (E_INVALIDARG), so a longer exposure needs a larger MaxET (see
+// EnsureMaxExposure). With MaxET = 4000000, -e 4 gives a real 4 s exposure. Above that, NokiaElfsPlugIn::Init refuses
+// the value with 0xE801000E, even when MaxET is larger. With -r this path isn't used (see ApplyRawExposure).
 static void ApplyManualExposure(WMD::IVideoDeviceController *videoController, int iso, INT64 exposure100ns,
 	BOOL restoring = FALSE)
 {
@@ -2185,6 +2217,8 @@ static HRESULT CapturePhoto(WMC::IMediaCapture *capture, const wchar_t *outputPa
 // So -r sets the value, and afterwards writes back the original value (0 if there was none), opens the camera once
 // so that the driver reads it, and only then deletes what it created. The original state is saved next to the value
 // (wp81camdump.* values): if a run dies before the end, the next run of wp81camdump finishes the restore.
+// Other drivers read ManufacturingMode too, but only when they start: audio default device, ALS/proximity thresholds,
+// Assertive Display, IP over USB policy, and vibrator voltage (that one checks only that the key exists).
 #define MMOS_KEY L"Software\\Microsoft\\ManufacturingOS"
 #define MMOS_VALUE L"ManufacturingMode"
 #define MARKER_KEY_CREATED L"wp81camdump.KeyCreated"      // 1: the key didn't exist
@@ -2496,7 +2530,8 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 		hr = raw ? CaptureRawPhoto(outputPath, rawStream, rawType) : CapturePhoto(capture.Get(), outputPath);
 	}
 
-	// Back to auto before the camera is released: the driver keeps the manual values in the next sessions
+	// Back to auto before the camera is released: the driver keeps the manual values in the next sessions, and on the
+	// Lumia 520 it then delivers empty frames (green JPEGs) in every following camera session until a reboot
 	if (iso > 0 || exposure100ns > 0)
 	{
 		if (verbose) printf("Restoring auto exposure/ISO\n");
