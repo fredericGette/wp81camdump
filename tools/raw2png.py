@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Converts a raw Bayer frame saved by `wp81camdump -r` into a viewable PNG.
+"""Converts a raw Bayer frame saved by `wp81camdump -r` into a viewable PNG, or into three false-color
+PNGs (one per Bayer channel) with --planes.
 
 The format is read from the sidecar `<file>.txt` written by wp81camdump (format, width, height,
-stride), and can be overridden on the command line.
+stride, Bayer order), and can be overridden on the command line.
 
 Supported formats (FourCC of the media type):
   MIPI  MIPI CSI-2 RAW10: 4 pixels in 5 bytes (8 MSBs of each pixel, then a byte with the 4 x 2 LSBs)
@@ -10,11 +11,20 @@ Supported formats (FourCC of the media type):
   PL16  10 bits in 16-bit little-endian words
   BA81  8 bits per pixel
 
-The picture is demosaiced at half resolution (one RGB pixel per 2x2 Bayer cell), then the black level
-is subtracted, a gray-world white balance and a 2.2 gamma are applied. Use --gray to see the sensor
-data without demosaic (to find the Bayer order), and try the 4 --order values to get the right colors.
+Default output: the picture is demosaiced at half resolution (one RGB pixel per 2x2 Bayer cell), then
+the black level is subtracted, a gray-world white balance and a 2.2 gamma are applied.
 
-Needs numpy. Writes a PNG with Pillow when available, a PPM/PGM otherwise.
+--gray: the sensor data without demosaic, as grayscale (to find the Bayer order). Try the 4 --order
+values to get the right colors.
+
+--planes: writes <out>_R.png, <out>_G.png and <out>_B.png at the full size of the raw frame. Each PNG
+pixel is the raw pixel at the same position. It is colored with the turbo colormap when it belongs to
+that channel, and black otherwise. No demosaic, black level or white balance: the colors show the raw
+10-bit values. The scale is the same for the three files: from the 0.1 to the 99.9 percentile of all
+the raw values, or --range LO HI.
+
+Needs numpy. Writes PNGs with Pillow when available, PPM/PGM otherwise. Uses matplotlib's turbo
+colormap when matplotlib is installed, else a polynomial approximation of it.
 """
 import argparse
 import os
@@ -101,6 +111,53 @@ def demosaic_half(raw, order):
     return np.dstack([r, (greens[0] + greens[1]) / 2, b])
 
 
+def turbo(x):
+    """Maps values in [0, 1] to RGB uint8 with the turbo colormap (matplotlib's table when available,
+    else Google's polynomial approximation of it)."""
+    x = np.clip(np.asarray(x, np.float32), 0, 1)
+    try:
+        from matplotlib import colormaps
+        return (colormaps["turbo"](x)[..., :3] * 255 + 0.5).astype(np.uint8)
+    except ImportError:
+        pass
+    coeffs = [
+        (0.13572138, 4.61539260, -42.66032258, 132.13108234, -152.94239396, 59.28637943),
+        (0.09140261, 2.19418839, 4.84296658, -14.18503333, 4.27729857, 2.82956604),
+        (0.10667330, 12.64194608, -60.58204836, 110.36276771, -89.90310912, 27.34824973),
+    ]
+    out = np.empty(x.shape + (3,), np.float32)
+    for i, c in enumerate(coeffs):
+        v = np.zeros_like(x)
+        for k in reversed(c):  # Horner
+            v = v * x + k
+        out[..., i] = v
+    return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
+def save_planes(raw, order, base, lo, hi):
+    h, w = raw.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    site = (yy % 2) * 2 + (xx % 2)  # index of the pixel in its 2x2 Bayer cell
+    order = order.upper()
+    masks = {c: np.isin(site, [i for i, o in enumerate(order) if o == c]) for c in "RGB"}
+    vals = raw.astype(np.float32)
+    if lo is None:
+        lo = float(np.percentile(vals, 0.1))
+    if hi is None:
+        hi = float(np.percentile(vals, 99.9))
+    if hi <= lo:
+        hi = lo + 1
+    print("turbo range: %.1f (blue) .. %.1f (red), in 10-bit units" % (lo, hi))
+    colored = turbo((vals - lo) / (hi - lo))
+    for name in "RGB":
+        m = masks[name]
+        plane = vals[m]
+        print("%s: %d pixels, min %.0f, max %.0f, mean %.1f" % (name, plane.size, plane.min(), plane.max(), plane.mean()))
+        img = np.zeros((h, w, 3), np.uint8)
+        img[m] = colored[m]
+        print("saved", save("%s_%s.png" % (base, name), img))
+
+
 def save(path, img):
     try:
         from PIL import Image
@@ -131,6 +188,12 @@ def main():
                     help="Bayer order (default: from the .txt, else RGGB; the Lumia 520 still is GBRG)")
     ap.add_argument("--black", type=float, default=64, help="black level in 10-bit units (default 64)")
     ap.add_argument("--gray", action="store_true", help="save the undemosaiced sensor data as grayscale")
+    ap.add_argument("--planes", action="store_true",
+                    help="save one full-resolution turbo-colored PNG per channel (other pixels black): "
+                         "<out>_R.png, <out>_G.png, <out>_B.png")
+    ap.add_argument("--range", type=float, nargs=2, metavar=("LO", "HI"),
+                    help="raw values mapped to the ends of the turbo colormap with --planes "
+                         "(default: 0.1 and 99.9 percentiles of all the raw values, the same for all three)")
     args = ap.parse_args()
 
     info = read_sidecar(args.raw + ".txt")
@@ -148,6 +211,10 @@ def main():
     print("%s %dx%d: min %d, max %d, mean %.1f" % (fmt, width, height, raw.min(), raw.max(), raw.mean()))
 
     out = args.output or args.raw + ".png"
+    if args.planes:
+        lo, hi = args.range if args.range else (None, None)
+        save_planes(raw, order, os.path.splitext(out)[0], lo, hi)
+        return
     if args.gray:
         img = (np.clip(raw.astype(np.float32) / 1023.0, 0, 1) ** (1 / 2.2) * 255 + 0.5).astype(np.uint8)
     else:

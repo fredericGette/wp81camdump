@@ -26,10 +26,21 @@ namespace WMP = ABI::Windows::Media::MediaProperties;
 #define DEFAULT_OUTPUT "C:\\Data\\Users\\Public\\Documents\\camdump.jpg"
 #define DEFAULT_RAW_OUTPUT "C:\\Data\\Users\\Public\\Documents\\camdump.raw"
 
-#define ASYNC_TIMEOUT_MS 30000
+// Timeout of the camera operations: 30 s, + 4 frames with a long manual exposure (-e)
+static DWORD asyncTimeoutMs = 30000;
 
 static Win32Api win32Api;
 static BOOL verbose = FALSE;
+static BOOL rawCaptureMode = FALSE; // -r
+// Exposure time and ISO applied, read back from the controls (for the .txt of a raw still); 0 = auto/unknown
+static INT64 appliedExposure100ns = 0;
+static UINT32 appliedIso = 0;
+// -r: exposure (µs) and analog gain (Q8, 256 = 1x) written to the sensor before the raw still; 0 = unchanged
+static DWORD rawExposureUs = 0;
+static DWORD rawGainQ8 = 0;
+// -r: values read back from the sensor before the raw still (for the .txt); 0 = unknown
+static DWORD sensorExposureUs = 0;
+static DWORD sensorGainQ8 = 0;
 
 // RAII HSTRING
 class HStr {
@@ -56,15 +67,21 @@ static void PrintUsage()
 	printf("             By default a preview runs (to Windows.Phone.Media.Capture.MediaCapturePreviewSink)\n");
 	printf("             before the picture, so the auto exposure/focus can settle\n");
 	printf("  -d <ms>    Delay between the start of the preview and the picture (default 2000)\n");
-	printf("  -s         Keep the default photo resolution (default: the largest one)\n");
+	printf("  -s <w>x<h> Picture resolution, e.g. 2048x1536 (default: the largest one)\n");
+	printf("             With -r: the raw resolution, e.g. 2600x1948 (default: the one of the sensor, 2592x1944)\n");
 	printf("  -a         Audible: keep the shutter sound (default: no sound)\n");
-	printf("  -l         List the native media types of every camera stream, and exit\n");
+	printf("  -l         List the picture resolutions (for -s), and exit. With -r: the raw resolutions\n");
+	printf("             With -v: also the media types of every stream of the driver (debugging)\n");
 	printf("  -r         Raw: save the still in a raw Bayer format of the sensor, as it is (+ a .txt with the format)\n");
-	printf("             Needs the PT formats of the driver (ManufacturingOS ManufacturingMode = 1)\n");
+	printf("             Sets HKLM\\Software\\Microsoft\\ManufacturingOS ManufacturingMode = 1 for the capture, then restores it\n");
 	printf("  -c <n>     With -r: take <n> raw stills in the same session (<name>_1.raw, ...)\n");
 	printf("  -g         With -r: first a throwaway still in the largest raw type, to make the driver reallocate\n");
 	printf("             its raw buffer (only the first camera session after boot gets raw data otherwise)\n");
-	printf("  -t <s>:<t> With -r: use the media type <t> of the stream <s> (indexes printed by -l)\n");
+	printf("  -e <time>  Exposure time in seconds: 1/125, 0.5, ... up to 4, or auto (default: auto)\n");
+	printf("             Sets HKLM\\Software\\OEM\\Nokia\\Camera\\RFC\\Caps MaxET = 4000000 (the 1 s default limit -> 4 s)\n");
+	printf("  -i <iso>   ISO speed: 100, 800, ... or auto (default: auto)\n");
+	printf("             With -r, -e and -i are written to the sensor itself: exposure, and analog gain = ISO / 100\n");
+	printf("             (the .txt gives the values read back from the sensor)\n");
 	printf("Default output: %s (%s with -r)\n", DEFAULT_OUTPUT, DEFAULT_RAW_OUTPUT);
 }
 
@@ -225,6 +242,28 @@ public:
 	virtual HRESULT STDMETHODCALLTYPE TakePhoto() = 0;
 	virtual HRESULT STDMETHODCALLTYPE GetSink(int sinkType, IMFCaptureSink_ **sink) = 0;
 	virtual HRESULT STDMETHODCALLTYPE GetSource(IMFCaptureSource_ **source) = 0;
+};
+
+// IKsControl (ksproxy.h is desktop only)
+struct KSPROPERTY_
+{
+	GUID Set;
+	ULONG Id;
+	ULONG Flags;
+};
+#define KSPROPERTY_TYPE_GET_ 0x00000001
+#define KSPROPERTY_TYPE_SET_ 0x00000002
+
+MIDL_INTERFACE("28F54685-06FD-11D2-B27A-00A0C9223196")
+IKsControl_ : public IUnknown
+{
+public:
+	virtual HRESULT STDMETHODCALLTYPE KsProperty(KSPROPERTY_ *property, ULONG propertyLength, void *data, ULONG dataLength,
+		ULONG *bytesReturned) = 0;
+	virtual HRESULT STDMETHODCALLTYPE KsMethod(void *method, ULONG methodLength, void *data, ULONG dataLength,
+		ULONG *bytesReturned) = 0;
+	virtual HRESULT STDMETHODCALLTYPE KsEvent(void *event, ULONG eventLength, void *data, ULONG dataLength,
+		ULONG *bytesReturned) = 0;
 };
 
 // Media type attributes (values from mfapi.h, defined here to link only against mincore.lib)
@@ -594,7 +633,7 @@ static void FormatSubtype(const GUID &g, char *out, size_t size)
 	}
 }
 
-static void PrintMediaType(const char *prefix, IMFMediaType *type)
+static void PrintMediaType(const char *prefix, IMFMediaType *type, const char *suffix = "")
 {
 	GUID major = {}, subtype = {};
 	type->GetGUID(MF_MT_MAJOR_TYPE_, &major);
@@ -611,8 +650,69 @@ static void PrintMediaType(const char *prefix, IMFMediaType *type)
 	type->GetUINT32(MF_MT_DEFAULT_STRIDE_, &stride);
 	type->GetUINT32(MF_MT_SAMPLE_SIZE_, &sampleSize);
 	UINT32 rateDen = (UINT32)frameRate;
-	printf("%s%s %s %ux%u stride %d sample %u fps %u/%u\n", prefix, majorName, sub,
-		(UINT32)(frameSize >> 32), (UINT32)frameSize, (int)stride, sampleSize, (UINT32)(frameRate >> 32), rateDen);
+	printf("%s%s %s %ux%u stride %d sample %u fps %u/%u%s\n", prefix, majorName, sub,
+		(UINT32)(frameSize >> 32), (UINT32)frameSize, (int)stride, sampleSize, (UINT32)(frameRate >> 32), rateDen, suffix);
+}
+
+// The size of the sensor, as far as the driver tells: its largest non-raw (NV12) size, 2592x1936 on the Lumia 520.
+// The raw types of the PT still pin are a fixed table shared with other Nokia sensors (up to 41 MP), so most of them
+// are larger than the sensor of the phone.
+static void GetSensorSize(IMFCaptureSource_ *source, UINT32 *width, UINT32 *height)
+{
+	*width = 0;
+	*height = 0;
+	DWORD streamCount = 0;
+	source->GetDeviceStreamCount(&streamCount);
+	for (DWORD s = 0; s < streamCount; s++)
+	{
+		for (DWORD t = 0;; t++)
+		{
+			ComPtr<IMFMediaType> type;
+			if (FAILED(source->GetAvailableDeviceMediaType(s, t, &type))) break;
+			GUID subtype = {};
+			type->GetGUID(MF_MT_SUBTYPE_, &subtype);
+			if (IsBayerSubtype(subtype)) continue;
+			UINT64 frameSize = 0;
+			type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
+			if ((frameSize >> 32) * (UINT32)frameSize > (UINT64)*width * *height)
+			{
+				*width = (UINT32)(frameSize >> 32);
+				*height = (UINT32)frameSize;
+			}
+		}
+	}
+}
+
+// The raw type used by -r without -s: the one closest to the sensor size (2592x1944 on the Lumia 520).
+static BOOL FindDefaultRawType(IMFCaptureSource_ *source, DWORD *streamOut, DWORD *typeOut)
+{
+	UINT32 refWidth, refHeight;
+	GetSensorSize(source, &refWidth, &refHeight);
+	DWORD streamCount = 0;
+	source->GetDeviceStreamCount(&streamCount);
+	UINT64 bestDistance = ~0ULL;
+	for (DWORD s = 0; s < streamCount; s++)
+	{
+		for (DWORD t = 0;; t++)
+		{
+			ComPtr<IMFMediaType> type;
+			if (FAILED(source->GetAvailableDeviceMediaType(s, t, &type))) break;
+			GUID subtype = {};
+			type->GetGUID(MF_MT_SUBTYPE_, &subtype);
+			if (!IsBayerSubtype(subtype)) continue;
+			UINT64 frameSize = 0;
+			type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
+			INT64 dw = (INT64)(frameSize >> 32) - refWidth, dh = (INT64)(UINT32)frameSize - refHeight;
+			UINT64 distance = (UINT64)(dw * dw + dh * dh);
+			if (distance < bestDistance)
+			{
+				bestDistance = distance;
+				*streamOut = s;
+				*typeOut = t;
+			}
+		}
+	}
+	return bestDistance != ~0ULL;
 }
 
 // Lists the native media types of every stream of the camera (IMFCaptureSource of the engine of MediaCapture).
@@ -633,6 +733,12 @@ static HRESULT ListNativeFormats()
 
 	// MF_CAPTURE_ENGINE_STREAM_CATEGORY
 	static const char *categories[] = { "video preview", "video capture", "photo independent", "photo dependent", "audio", "unsupported" };
+	printf("Media types of every stream of the driver (debugging):\n");
+	int rawTypes = 0;
+	UINT32 sensorWidth, sensorHeight;
+	GetSensorSize(source.Get(), &sensorWidth, &sensorHeight);
+	DWORD defaultStream = ~0u, defaultType = ~0u;
+	FindDefaultRawType(source.Get(), &defaultStream, &defaultType);
 	for (DWORD s = 0; s < streamCount; s++)
 	{
 		int category = -1;
@@ -650,11 +756,138 @@ static HRESULT ListNativeFormats()
 			ComPtr<IMFMediaType> type;
 			hr = source->GetAvailableDeviceMediaType(s, t, &type);
 			if (FAILED(hr)) break;
+			GUID subtype = {};
+			type->GetGUID(MF_MT_SUBTYPE_, &subtype);
+			BOOL raw = IsBayerSubtype(subtype);
+			const char *note = "";
+			if (raw)
+			{
+				rawTypes++;
+				UINT64 frameSize = 0;
+				type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
+				UINT32 width = (UINT32)(frameSize >> 32), height = (UINT32)frameSize;
+				// 3% margin: the raw frame has a few more rows/columns than the NV12 picture (2592x1944 for 2592x1936)
+				if (s == defaultStream && t == defaultType) note = "  <- used by -r";
+				else if (sensorWidth && ((UINT64)width * 100 > (UINT64)sensorWidth * 103 ||
+					(UINT64)height * 100 > (UINT64)sensorHeight * 103))
+				{
+					note = "  (not this sensor: larger than its picture size)";
+				}
+			}
 			char prefix[32];
-			sprintf_s(prefix, sizeof(prefix), "  [%lu] ", t);
-			PrintMediaType(prefix, type.Get());
+			sprintf_s(prefix, sizeof(prefix), "  [%lu] %s", t, raw ? "RAW " : "");
+			PrintMediaType(prefix, type.Get(), note);
 		}
 	}
+	if (rawTypes == 0) printf("No RAW type: the driver only exposes them in manufacturing mode (-r)\n");
+	return S_OK;
+}
+
+// Describes a raw subtype for the lists
+static const char *RawFormatName(const GUID &subtype, char *buffer, size_t size)
+{
+	static const GUID idealRaw = { 0x009D4DF4, 0x0A60, 0x4020, { 0xA7, 0x79, 0xA6, 0x76, 0x11, 0xE7, 0x68, 0x4A } };
+	if (IsEqualGUID(subtype, idealRaw)) return "10-bit Bayer GBRG, Qualcomm packed";
+	if (subtype.Data1 == 0x4950494D /* MIPI */) return "Bayer, MIPI packed";
+	FormatSubtype(subtype, buffer, size);
+	return buffer;
+}
+
+// Finds the raw type with the given size (-r -s)
+static BOOL FindRawTypeBySize(IMFCaptureSource_ *source, UINT32 width, UINT32 height, int *streamOut, int *typeOut)
+{
+	DWORD streamCount = 0;
+	source->GetDeviceStreamCount(&streamCount);
+	for (DWORD s = 0; s < streamCount; s++)
+	{
+		for (DWORD t = 0;; t++)
+		{
+			ComPtr<IMFMediaType> type;
+			if (FAILED(source->GetAvailableDeviceMediaType(s, t, &type))) break;
+			GUID subtype = {};
+			type->GetGUID(MF_MT_SUBTYPE_, &subtype);
+			if (!IsBayerSubtype(subtype)) continue;
+			UINT64 frameSize = 0;
+			type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
+			if ((UINT32)(frameSize >> 32) == width && (UINT32)frameSize == height)
+			{
+				*streamOut = (int)s;
+				*typeOut = (int)t;
+				return TRUE;
+			}
+		}
+	}
+	return FALSE;
+}
+
+// Lists the raw resolutions (-r -l), smallest first
+static HRESULT ListRawResolutions()
+{
+	ComPtr<IMFCaptureSource_> source;
+	if (capturedEngine == nullptr || FAILED(capturedEngine->GetSource(&source)))
+	{
+		printf("The capture engine of MediaCapture wasn't caught\n");
+		return E_FAIL;
+	}
+	UINT32 sensorWidth, sensorHeight;
+	GetSensorSize(source.Get(), &sensorWidth, &sensorHeight);
+	DWORD defaultStream = ~0u, defaultType = ~0u;
+	FindDefaultRawType(source.Get(), &defaultStream, &defaultType);
+
+	struct RawEntry { UINT32 width, height; GUID subtype; BOOL isDefault; };
+	RawEntry entries[32];
+	int n = 0;
+	DWORD streamCount = 0;
+	source->GetDeviceStreamCount(&streamCount);
+	for (DWORD s = 0; s < streamCount; s++)
+	{
+		for (DWORD t = 0; n < 32; t++)
+		{
+			ComPtr<IMFMediaType> type;
+			if (FAILED(source->GetAvailableDeviceMediaType(s, t, &type))) break;
+			GUID subtype = {};
+			type->GetGUID(MF_MT_SUBTYPE_, &subtype);
+			if (!IsBayerSubtype(subtype)) continue;
+			UINT64 frameSize = 0;
+			type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
+			UINT32 width = (UINT32)(frameSize >> 32), height = (UINT32)frameSize;
+			BOOL seen = FALSE;
+			for (int j = 0; j < n; j++) seen |= entries[j].width == width && entries[j].height == height;
+			if (seen) continue; // -s picks the first one
+			entries[n].width = width;
+			entries[n].height = height;
+			entries[n].subtype = subtype;
+			entries[n].isDefault = (s == defaultStream && t == defaultType);
+			n++;
+		}
+	}
+	if (n == 0)
+	{
+		printf("No raw resolution: the driver didn't switch to manufacturing mode\n");
+		return MF_E_INVALIDMEDIATYPE;
+	}
+	for (int i = 1; i < n; i++)
+	{
+		for (int j = i; j > 0 && (UINT64)entries[j - 1].width * entries[j - 1].height > (UINT64)entries[j].width * entries[j].height; j--)
+		{
+			RawEntry e = entries[j];
+			entries[j] = entries[j - 1];
+			entries[j - 1] = e;
+		}
+	}
+	printf("Raw resolutions (-r -s <width>x<height>):\n");
+	for (int i = 0; i < n; i++)
+	{
+		char buffer[64], size[24];
+		sprintf_s(size, sizeof(size), "%ux%u", entries[i].width, entries[i].height);
+		// 3% margin: the raw frame has a few more rows/columns than the picture (2592x1944 for 2592x1936)
+		BOOL larger = sensorWidth && ((UINT64)entries[i].width * 100 > (UINT64)sensorWidth * 103 ||
+			(UINT64)entries[i].height * 100 > (UINT64)sensorHeight * 103);
+		printf("  %-10s %s%s\n", size, RawFormatName(entries[i].subtype, buffer, sizeof(buffer)),
+			entries[i].isDefault ? "  (default)" : larger ? "  (larger than the sensor)" : "");
+	}
+	printf("The driver has a fixed list of raw types, shared with other Nokia sensors (up to 41 MP). It accepts the\n");
+	printf("larger ones, but the sensor still sends only its own frame (%ux%u + a few rows).\n", sensorWidth, sensorHeight);
 	return S_OK;
 }
 
@@ -805,6 +1038,80 @@ static BOOL FindLargestIdealRawType(int *streamOut, int *typeOut)
 	return best != 0;
 }
 
+// CameraDiagnostics property set of qccamavs8930.sys (CameraDiagnostics::ControlCamera), only in manufacturing mode:
+// 5 = EXPOSURE_TIME (ULONG µs), 7 = GAIN_AND_EXPOSURE (ULONG µs + USHORT analog gain Q8). The setters write the sensor
+// directly (sensor ioctl 0x43), without the 3A, then wait one frame interval (max 200 ms).
+static const GUID PROPSETID_CAMERA_DIAGNOSTIC_ = { 0x2ed26bd2, 0x811f, 0x42e8, { 0xa8, 0x1a, 0x91, 0x99, 0xac, 0xe1, 0x9d, 0x36 } };
+#define KSPROPERTY_CAMERA_DIAGNOSTIC_GAIN_AND_EXPOSURE_ 7
+
+static HRESULT SensorGainAndExposure(BOOL set, DWORD *exposureUs, DWORD *gainQ8)
+{
+	ComPtr<IMFCaptureSource_> source;
+	ComPtr<IUnknown> deviceSource;
+	ComPtr<IKsControl_> ksControl;
+	HRESULT hr = capturedEngine ? capturedEngine->GetSource(&source) : E_FAIL;
+	if (SUCCEEDED(hr)) hr = source->GetCaptureDeviceSource(1 /* MF_CAPTURE_ENGINE_DEVICE_TYPE_VIDEO */, &deviceSource);
+	if (SUCCEEDED(hr)) hr = deviceSource.As(&ksControl);
+	if (FAILED(hr))
+	{
+		printf("Cannot get the IKsControl of the camera 0x%08lX\n", (unsigned long)hr);
+		return hr;
+	}
+	KSPROPERTY_ property = { PROPSETID_CAMERA_DIAGNOSTIC_, KSPROPERTY_CAMERA_DIAGNOSTIC_GAIN_AND_EXPOSURE_,
+		(ULONG)(set ? KSPROPERTY_TYPE_SET_ : KSPROPERTY_TYPE_GET_) };
+	struct { DWORD exposureUs; WORD gainQ8; WORD reserved; } data = {};
+	if (set)
+	{
+		data.exposureUs = *exposureUs;
+		data.gainQ8 = (WORD)(*gainQ8 > 0xFFFF ? 0xFFFF : *gainQ8);
+	}
+	ULONG returned = 0;
+	hr = ksControl->KsProperty(&property, sizeof(property), &data, sizeof(data), &returned);
+	if (SUCCEEDED(hr) && !set)
+	{
+		*exposureUs = data.exposureUs;
+		*gainQ8 = data.gainQ8;
+	}
+	return hr;
+}
+
+// -r: writes rawExposureUs/rawGainQ8 to the sensor (the -e/-i of the normal path don't reach it: the raw still is taken
+// with the sensor settings of manufacturing mode), then reads the values back for the .txt.
+static void ApplyRawExposure()
+{
+	DWORD exposureUs = 0, gainQ8 = 0;
+	HRESULT hr = SensorGainAndExposure(FALSE, &exposureUs, &gainQ8);
+	if (FAILED(hr))
+	{
+		printf("Warning: cannot read the sensor exposure 0x%08lX\n", (unsigned long)hr);
+		return;
+	}
+	if (verbose) printf("  sensor before: exposure %.3f ms, analog gain %.2fx\n", exposureUs / 1000.0, gainQ8 / 256.0);
+	if (rawExposureUs != 0 || rawGainQ8 != 0)
+	{
+		if (rawExposureUs != 0) exposureUs = rawExposureUs;
+		if (rawGainQ8 != 0) gainQ8 = rawGainQ8;
+		hr = SensorGainAndExposure(TRUE, &exposureUs, &gainQ8);
+		if (FAILED(hr)) printf("Warning: cannot set the sensor exposure/gain 0x%08lX\n", (unsigned long)hr);
+		// The frame being exposed still has the old values: wait for one with the new ones
+		DWORD waitMs = exposureUs / 1000 * 2 + 200;
+		if (waitMs > 10000) waitMs = 10000;
+		Sleep(waitMs);
+		asyncTimeoutMs = 30000 + exposureUs / 1000 * 4;
+		if (FAILED(SensorGainAndExposure(FALSE, &exposureUs, &gainQ8))) exposureUs = gainQ8 = 0;
+		if (rawExposureUs != 0 && exposureUs != 0 && exposureUs < rawExposureUs - rawExposureUs / 100)
+		{
+			// qccamsensor8930.sys converts the µs into sensor lines and caps them to 0xFFFF (16-bit coarse
+			// integration register): 65535 lines of 98.09 µs = 6.43 s on the Lumia 520
+			printf("Warning: the sensor limits the exposure to 65535 lines (%.3f ms here)\n", exposureUs / 1000.0);
+		}
+	}
+	sensorExposureUs = exposureUs;
+	sensorGainQ8 = gainQ8;
+	printf("Sensor: exposure %.3f ms, analog gain %.2fx (ISO %lu if 1x = ISO 100)\n", exposureUs / 1000.0, gainQ8 / 256.0,
+		(gainQ8 * 100 + 128) / 256);
+}
+
 static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int forcedType)
 {
 	if (capturedEngine == nullptr)
@@ -826,62 +1133,60 @@ static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int 
 	{
 		stream = (DWORD)forcedStream;
 		hr = source->GetAvailableDeviceMediaType(stream, (DWORD)forcedType, &rawType);
-		CHECK(hr, "IMFCaptureSource::GetAvailableDeviceMediaType");
+		if (FAILED(hr))
+		{
+			printf("No media type %d:%d (0x%08lX)\n", forcedStream, forcedType, (unsigned long)hr);
+			return hr;
+		}
+		GUID subtype = {};
+		rawType->GetGUID(MF_MT_SUBTYPE_, &subtype);
+		if (!IsBayerSubtype(subtype))
+		{
+			printf("Media type %d:%d isn't a raw type: ", forcedStream, forcedType);
+			PrintMediaType("", rawType.Get());
+			return MF_E_INVALIDMEDIATYPE;
+		}
 	}
 	else
 	{
 		// The PT ranges are shared with other Nokia sensors (up to 41 MP): take the raw type closest to the
 		// largest NV12 size of the camera (2592x1936 on the Lumia 520 → raw 2592x1944)
-		UINT32 refWidth = 0, refHeight = 0;
-		for (DWORD s = 0; s < streamCount; s++)
+		DWORD defaultType = 0;
+		if (FindDefaultRawType(source.Get(), &stream, &defaultType))
 		{
-			for (DWORD t = 0;; t++)
-			{
-				ComPtr<IMFMediaType> type;
-				if (FAILED(source->GetAvailableDeviceMediaType(s, t, &type))) break;
-				GUID subtype = {};
-				type->GetGUID(MF_MT_SUBTYPE_, &subtype);
-				if (IsBayerSubtype(subtype)) continue;
-				UINT64 frameSize = 0;
-				type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
-				if ((frameSize >> 32) * (UINT32)frameSize > (UINT64)refWidth * refHeight)
-				{
-					refWidth = (UINT32)(frameSize >> 32);
-					refHeight = (UINT32)frameSize;
-				}
-			}
-		}
-		UINT64 bestDistance = ~0ULL;
-		for (DWORD s = 0; s < streamCount; s++)
-		{
-			for (DWORD t = 0;; t++)
-			{
-				ComPtr<IMFMediaType> type;
-				if (FAILED(source->GetAvailableDeviceMediaType(s, t, &type))) break;
-				GUID subtype = {};
-				type->GetGUID(MF_MT_SUBTYPE_, &subtype);
-				if (!IsBayerSubtype(subtype)) continue;
-				UINT64 frameSize = 0;
-				type->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
-				INT64 dw = (INT64)(frameSize >> 32) - refWidth, dh = (INT64)(UINT32)frameSize - refHeight;
-				UINT64 distance = (UINT64)(dw * dw + dh * dh);
-				if (distance < bestDistance)
-				{
-					bestDistance = distance;
-					stream = s;
-					rawType = type;
-				}
-			}
+			source->GetAvailableDeviceMediaType(stream, defaultType, &rawType);
 		}
 		if (!rawType)
 		{
-			printf("No raw Bayer media type exposed by the camera (see -l).\n");
-			printf("The driver only exposes them when HKLM\\Software\\Microsoft\\ManufacturingOS ManufacturingMode = 1\n");
+			printf("No raw Bayer media type exposed by the camera (see -r -l).\n");
+			printf("The driver only exposes them when ManufacturingOS ManufacturingMode = 1 (set by -r)\n");
 			return MF_E_INVALIDMEDIATYPE;
 		}
 	}
-	printf("Raw stream %lu: ", stream);
-	PrintMediaType("", rawType.Get());
+	if (verbose)
+	{
+		printf("Raw stream %lu: ", stream);
+		PrintMediaType("", rawType.Get());
+	}
+	{
+		UINT64 frameSize = 0;
+		rawType->GetUINT64(MF_MT_FRAME_SIZE_, &frameSize);
+		UINT32 width = (UINT32)(frameSize >> 32), height = (UINT32)frameSize;
+		GUID subtype = {};
+		rawType->GetGUID(MF_MT_SUBTYPE_, &subtype);
+		static const GUID idealRaw = { 0x009D4DF4, 0x0A60, 0x4020, { 0xA7, 0x79, 0xA6, 0x76, 0x11, 0xE7, 0x68, 0x4A } };
+		if (IsEqualGUID(subtype, idealRaw))
+		{
+			printf("Raw resolution: %ux%u, 10-bit Bayer GBRG, Qualcomm packed (6 pixels in 8 bytes, %u bytes per row)\n",
+				width, height, (width + 5) / 6 * 8);
+		}
+		else
+		{
+			char sub[64];
+			FormatSubtype(subtype, sub, sizeof(sub));
+			printf("Raw resolution: %ux%u, format %s\n", width, height, sub);
+		}
+	}
 
 	if (eventFilter == nullptr)
 	{
@@ -933,6 +1238,8 @@ static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int 
 	}
 	if (SUCCEEDED(hr))
 	{
+		// After the raw media type is set (it may reconfigure the sensor), just before the still
+		ApplyRawExposure();
 		hr = capturedEngine->TakePhoto();
 		if (FAILED(hr)) printf("IMFCaptureEngine::TakePhoto failed 0x%08lX\n", (unsigned long)hr);
 	}
@@ -940,7 +1247,7 @@ static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int 
 	{
 		if (verbose) printf("IMFCaptureEngine::TakePhoto OK\n");
 		HANDLE handles[2] = { callback->done, eventFilter->photoTaken };
-		DWORD wait = WaitForMultipleObjectsEx(2, handles, FALSE, ASYNC_TIMEOUT_MS, FALSE);
+		DWORD wait = WaitForMultipleObjectsEx(2, handles, FALSE, asyncTimeoutMs, FALSE);
 		if (wait == WAIT_OBJECT_0 + 1)
 		{
 			// PHOTO_TAKEN (or an error) before the sample
@@ -956,7 +1263,7 @@ static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int 
 		}
 		if (SUCCEEDED(hr) && wait == WAIT_TIMEOUT)
 		{
-			printf("No raw sample after %u ms\n", ASYNC_TIMEOUT_MS);
+			printf("No raw sample after %lu ms\n", asyncTimeoutMs);
 			hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 		}
 		else if (SUCCEEDED(hr) && !callback->sample)
@@ -1005,12 +1312,19 @@ static HRESULT CaptureRawPhoto(const wchar_t *outputPath, int forcedStream, int 
 					order = "GBRG";
 					stride = (width + 5) / 6 * 8;
 				}
-				char text[320];
-				int n = sprintf_s(text, sizeof(text), "format=%s\nsubtype=%s\nwidth=%u\nheight=%u\nstride=%d\norder=%s\nbytes=%lu\n",
-					fourcc, sub, width, (UINT32)frameSize, (int)stride, order, length);
+				char text[400];
+				// Read back from the sensor; iso: 100 per 1x of analog gain (assumption)
+				int n = sprintf_s(text, sizeof(text),
+					"format=%s\nsubtype=%s\nwidth=%u\nheight=%u\nstride=%d\norder=%s\nbytes=%lu\nexposure_us=%lu\niso=%lu\n"
+					"gain_q8=%lu\n",
+					fourcc, sub, width, (UINT32)frameSize, (int)stride, order, length, sensorExposureUs,
+					(sensorGainQ8 * 100 + 128) / 256, sensorGainQ8);
 				wchar_t sidecar[MAX_PATH];
 				swprintf_s(sidecar, MAX_PATH, L"%s.txt", outputPath);
-				if (SUCCEEDED(hr) && n > 0) WriteFileData(sidecar, text, (DWORD)n);
+				if (SUCCEEDED(hr) && n > 0 && SUCCEEDED(WriteFileData(sidecar, text, (DWORD)n)))
+				{
+					printf("Raw format saved: %ls\n", sidecar);
+				}
 			}
 		}
 		if (FAILED(hr)) printf("Cannot read the raw sample 0x%08lX\n", (unsigned long)hr);
@@ -1057,7 +1371,7 @@ static HRESULT WaitAction(WF::IAsyncAction *action, const char *what)
 			info->get_ErrorCode(&errorCode);
 			return errorCode;
 		}
-		if (elapsed >= ASYNC_TIMEOUT_MS)
+		if (elapsed >= asyncTimeoutMs)
 		{
 			printf("%s timed out after %lu ms\n", what, elapsed);
 			info->Cancel();
@@ -1095,10 +1409,62 @@ static BOOL SameAspectRatio(UINT32 w1, UINT32 h1, UINT32 w2, UINT32 h2)
 	return diff * 50 <= (a > b ? a : b);
 }
 
+
+// Lists the picture (JPEG) resolutions, for -s.
+static void PrintPhotoResolutions(WMC::IMediaCapture *capture)
+{
+	ComPtr<WMD::IVideoDeviceController> videoController;
+	ComPtr<WMD::IMediaDeviceController> controller;
+	ComPtr<WFC::IVectorView<WMP::IMediaEncodingProperties *>> list;
+	unsigned int count = 0;
+	if (FAILED(capture->get_VideoDeviceController(&videoController)) || FAILED(videoController.As(&controller)) ||
+		FAILED(controller->GetAvailableMediaStreamProperties(WMC::MediaStreamType_Photo, &list)) || FAILED(list->get_Size(&count)))
+	{
+		printf("Cannot list the picture resolutions\n");
+		return;
+	}
+	UINT32 sizes[64][2];
+	int n = 0;
+	UINT64 largest = 0;
+	for (unsigned int i = 0; i < count && n < 64; i++)
+	{
+		ComPtr<WMP::IMediaEncodingProperties> props;
+		if (FAILED(list->GetAt(i, &props))) continue;
+		UINT32 width, height;
+		GetSize(props.Get(), &width, &height);
+		BOOL seen = FALSE;
+		for (int j = 0; j < n; j++) seen |= sizes[j][0] == width && sizes[j][1] == height;
+		if (seen) continue;
+		sizes[n][0] = width;
+		sizes[n][1] = height;
+		n++;
+		if ((UINT64)width * height > largest) largest = (UINT64)width * height;
+	}
+	// Smallest first
+	for (int i = 1; i < n; i++)
+	{
+		for (int j = i; j > 0 && (UINT64)sizes[j - 1][0] * sizes[j - 1][1] > (UINT64)sizes[j][0] * sizes[j][1]; j--)
+		{
+			UINT32 w = sizes[j][0], h = sizes[j][1];
+			sizes[j][0] = sizes[j - 1][0];
+			sizes[j][1] = sizes[j - 1][1];
+			sizes[j - 1][0] = w;
+			sizes[j - 1][1] = h;
+		}
+	}
+	printf("Picture resolutions (-s <width>x<height>):\n");
+	for (int j = 0; j < n; j++)
+	{
+		printf("  %ux%u%s\n", sizes[j][0], sizes[j][1], (UINT64)sizes[j][0] * sizes[j][1] == largest ? " (default)" : "");
+	}
+}
+
 // Selects the largest resolution of a stream. When aspectWidth/aspectHeight aren't 0,
 // only the resolutions with the same aspect ratio are considered.
+// When requiredWidth/requiredHeight aren't 0, only that exact resolution is accepted.
 static HRESULT SelectLargestResolution(WMD::IMediaDeviceController *controller, WMC::MediaStreamType streamType,
-	const char *name, UINT32 aspectWidth, UINT32 aspectHeight, UINT32 *selectedWidth, UINT32 *selectedHeight)
+	const char *name, UINT32 aspectWidth, UINT32 aspectHeight, UINT32 *selectedWidth, UINT32 *selectedHeight,
+	UINT32 requiredWidth = 0, UINT32 requiredHeight = 0)
 {
 	char what[128];
 	ComPtr<WFC::IVectorView<WMP::IMediaEncodingProperties *>> list;
@@ -1129,6 +1495,10 @@ static HRESULT SelectLargestResolution(WMD::IMediaDeviceController *controller, 
 		{
 			continue;
 		}
+		if (requiredWidth != 0 && (width != requiredWidth || height != requiredHeight))
+		{
+			continue;
+		}
 		if ((UINT64)width * height > bestPixels)
 		{
 			bestPixels = (UINT64)width * height;
@@ -1137,13 +1507,20 @@ static HRESULT SelectLargestResolution(WMD::IMediaDeviceController *controller, 
 	}
 	if (!best)
 	{
-		printf("No %s resolution available\n", name);
+		if (requiredWidth != 0) printf("No %s resolution %ux%u (wp81camdump -l lists them)\n", name, requiredWidth, requiredHeight);
+		else printf("No %s resolution available\n", name);
 		return E_FAIL;
 	}
 
 	UINT32 width, height;
 	GetSize(best.Get(), &width, &height);
-	printf("%s resolution: %ux%u\n", name, width, height);
+	// Verbose only: in raw mode the photo resolution (it only sets the aspect ratio of the preview), so that it can't
+	// be taken for the raw resolution, and the preview (it only feeds the 3A, it isn't saved)
+	BOOL isPreview = strcmp(name, "Preview") == 0;
+	if (verbose || (!rawCaptureMode && !isPreview))
+	{
+		printf("%s resolution: %ux%u%s\n", name, width, height, isPreview ? " (live stream for exposure/focus, not saved)" : "");
+	}
 	if (selectedWidth) *selectedWidth = width;
 	if (selectedHeight) *selectedHeight = height;
 
@@ -1211,6 +1588,494 @@ static HRESULT StartPreview(WMC::IMediaCapture *capture, WMD::IMediaDeviceContro
 	hr = WaitAction(action.Get(), "StartPreviewToCustomSinkAsync");
 	CHECK(hr, "StartPreviewToCustomSinkAsync completion");
 	return S_OK;
+}
+
+static const struct { UINT32 iso; WMD::IsoSpeedPreset preset; } isoPresets[] = {
+	{ 50, WMD::IsoSpeedPreset_Iso50 }, { 80, WMD::IsoSpeedPreset_Iso80 }, { 100, WMD::IsoSpeedPreset_Iso100 },
+	{ 200, WMD::IsoSpeedPreset_Iso200 }, { 400, WMD::IsoSpeedPreset_Iso400 }, { 800, WMD::IsoSpeedPreset_Iso800 },
+	{ 1600, WMD::IsoSpeedPreset_Iso1600 }, { 3200, WMD::IsoSpeedPreset_Iso3200 }, { 6400, WMD::IsoSpeedPreset_Iso6400 },
+	{ 12800, WMD::IsoSpeedPreset_Iso12800 }, { 25600, WMD::IsoSpeedPreset_Iso25600 },
+};
+
+static UINT32 IsoOfPreset(WMD::IsoSpeedPreset preset)
+{
+	for (size_t i = 0; i < ARRAYSIZE(isoPresets); i++)
+	{
+		if (isoPresets[i].preset == preset) return isoPresets[i].iso;
+	}
+	return 0; // Auto
+}
+
+static void PrintIsoPresets(WMD::IIsoSpeedControl *control)
+{
+	ComPtr<WFC::IVectorView<WMD::IsoSpeedPreset>> presets;
+	UINT32 count = 0;
+	if (FAILED(control->get_SupportedPresets(&presets)) || !presets || FAILED(presets->get_Size(&count))) return;
+	printf("  ISO presets:");
+	for (UINT32 i = 0; i < count; i++)
+	{
+		WMD::IsoSpeedPreset preset;
+		if (FAILED(presets->GetAt(i, &preset))) continue;
+		UINT32 iso = IsoOfPreset(preset);
+		if (iso) printf(" %u", iso);
+		else printf(" auto");
+	}
+	printf("\n");
+}
+
+// Sets the exposure time (100 ns units) and the ISO speed. -1 = keep as is, 0 = auto.
+// Failures are warnings: the picture is still taken, and the applied values are printed.
+static void ApplyManualExposure(WMD::IVideoDeviceController *videoController, int iso, INT64 exposure100ns,
+	BOOL restoring = FALSE)
+{
+	if (iso < 0 && exposure100ns < 0) return;
+	BOOL report = verbose || !restoring; // the read-back values
+
+	ComPtr<WMD::IAdvancedVideoCaptureDeviceController2> advanced;
+	HRESULT hr = videoController->QueryInterface(__uuidof(WMD::IAdvancedVideoCaptureDeviceController2),
+		(void **)advanced.GetAddressOf());
+	if (FAILED(hr))
+	{
+		printf("Warning: no IAdvancedVideoCaptureDeviceController2 (0x%08lX): exposure and ISO stay automatic\n",
+			(unsigned long)hr);
+		return;
+	}
+
+	if (exposure100ns >= 0)
+	{
+		ComPtr<WMD::IExposureControl> exposure;
+		boolean supported = false;
+		hr = advanced->get_ExposureControl(&exposure);
+		if (SUCCEEDED(hr)) hr = exposure->get_Supported(&supported);
+		if (FAILED(hr) || !supported)
+		{
+			printf("Warning: exposure control not supported (0x%08lX)\n", (unsigned long)hr);
+		}
+		else
+		{
+			WF::TimeSpan minimum = {}, maximum = {}, step = {};
+			exposure->get_Min(&minimum);
+			exposure->get_Max(&maximum);
+			exposure->get_Step(&step);
+			if (verbose)
+			{
+				printf("  exposure range: %.3f ms .. %.3f ms, step %.3f ms\n", minimum.Duration / 10000.0,
+					maximum.Duration / 10000.0, step.Duration / 10000.0);
+			}
+			ComPtr<WF::IAsyncAction> action;
+			if (exposure100ns == 0)
+			{
+				hr = exposure->SetAutoAsync(true, &action);
+			}
+			else
+			{
+				WF::TimeSpan value;
+				value.Duration = exposure100ns;
+				if (value.Duration < minimum.Duration) value.Duration = minimum.Duration;
+				// MFCaptureEngine rejects a value above the maximum (E_INVALIDARG). The maximum is a default of the
+				// driver (1 s), raised by HKLM\Software\OEM\Nokia\Camera\RFC\Caps MaxET (µs): 4 s works on the Lumia 520
+				if (maximum.Duration > 0 && value.Duration > maximum.Duration) value.Duration = maximum.Duration;
+				if (value.Duration != exposure100ns)
+				{
+					printf("Warning: exposure %.3f ms out of range, clamped to %.3f ms\n", exposure100ns / 10000.0,
+						value.Duration / 10000.0);
+					if (value.Duration == maximum.Duration)
+					{
+						printf("(4 s is the limit of the camera driver)\n");
+					}
+				}
+				hr = exposure->SetValueAsync(value, &action);
+				asyncTimeoutMs = 30000 + (DWORD)(value.Duration / 10000) * 4;
+			}
+			if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "ExposureControl");
+			if (FAILED(hr)) printf("Warning: cannot set the exposure 0x%08lX\n", (unsigned long)hr);
+			if (hr == (HRESULT)0xE801000E)
+			{
+				// NokiaElfsPlugIn::Init (qccamavs8930.sys) caps the exposure to min(sensor maximum, 4000000 µs)
+				printf("(the 3A plug-in of the driver refuses exposures above 4 s)\n");
+			}
+
+			boolean isAuto = false;
+			WF::TimeSpan current = {};
+			exposure->get_Auto(&isAuto);
+			exposure->get_Value(&current);
+			if (!restoring) appliedExposure100ns = isAuto ? 0 : current.Duration;
+			if (!report) {}
+			else if (isAuto) printf("Exposure: auto\n");
+			else if (current.Duration >= 10000000) printf("Exposure: %.3f ms (%.1f s)\n", current.Duration / 10000.0,
+				current.Duration / 10000000.0);
+			else printf("Exposure: %.3f ms (1/%.0f s)\n", current.Duration / 10000.0,
+				current.Duration > 0 ? 10000000.0 / current.Duration : 0.0);
+		}
+	}
+
+	if (iso >= 0)
+	{
+		ComPtr<WMD::IIsoSpeedControl> isoControl;
+		boolean supported = false;
+		hr = advanced->get_IsoSpeedControl(&isoControl);
+		if (SUCCEEDED(hr)) hr = isoControl->get_Supported(&supported);
+		if (FAILED(hr) || !supported)
+		{
+			printf("Warning: ISO control not supported (0x%08lX)\n", (unsigned long)hr);
+			return;
+		}
+		if (verbose) PrintIsoPresets(isoControl.Get());
+
+		// IIsoSpeedControl2 (any value in a range) if the driver has it, else the presets
+		ComPtr<WMD::IIsoSpeedControl2> isoControl2;
+		isoControl.As(&isoControl2);
+		ComPtr<WF::IAsyncAction> action;
+		if (isoControl2)
+		{
+			UINT32 minimum = 0, maximum = 0, step = 0;
+			isoControl2->get_Min(&minimum);
+			isoControl2->get_Max(&maximum);
+			isoControl2->get_Step(&step);
+			if (verbose) printf("  ISO range: %u .. %u, step %u\n", minimum, maximum, step);
+			if (iso == 0)
+			{
+				hr = isoControl2->SetAutoAsync(&action);
+			}
+			else
+			{
+				UINT32 value = (UINT32)iso;
+				if (value < minimum) value = minimum;
+				if (maximum > 0 && value > maximum) value = maximum;
+				if (value != (UINT32)iso) printf("Warning: ISO %d out of range, clamped to %u\n", iso, value);
+				hr = isoControl2->SetValueAsync(value, &action);
+			}
+		}
+		else
+		{
+			WMD::IsoSpeedPreset preset = WMD::IsoSpeedPreset_Auto;
+			BOOL found = (iso == 0);
+			for (size_t i = 0; i < ARRAYSIZE(isoPresets) && !found; i++)
+			{
+				if (isoPresets[i].iso == (UINT32)iso)
+				{
+					preset = isoPresets[i].preset;
+					found = TRUE;
+				}
+			}
+			if (!found)
+			{
+				printf("Warning: no ISO preset %d\n", iso);
+				PrintIsoPresets(isoControl.Get());
+				return;
+			}
+			hr = isoControl->SetPresetAsync(preset, &action);
+		}
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "IsoSpeedControl");
+		if (FAILED(hr))
+		{
+			printf("Warning: cannot set the ISO 0x%08lX\n", (unsigned long)hr);
+			if (!verbose) PrintIsoPresets(isoControl.Get());
+		}
+
+		boolean isAuto = false;
+		UINT32 current = 0;
+		if (isoControl2)
+		{
+			isoControl2->get_Auto(&isAuto);
+			isoControl2->get_Value(&current);
+		}
+		else
+		{
+			WMD::IsoSpeedPreset preset = WMD::IsoSpeedPreset_Auto;
+			isoControl->get_Preset(&preset);
+			current = IsoOfPreset(preset);
+			isAuto = (current == 0);
+		}
+		if (!restoring) appliedIso = isAuto ? 0 : current;
+		if (!report) {}
+		else if (isAuto) printf("ISO: auto\n");
+		else printf("ISO: %u\n", current);
+	}
+}
+
+// Reads the current exposure time and ISO from the camera (for the EXIF of the JPEG).
+// 0 when unknown: in auto mode the Lumia 520 reports the minimum exposure and the last manual ISO, not the ones in use.
+static void ReadExposureState(WMC::IMediaCapture *capture, INT64 *exposure100ns, BOOL *exposureAuto, UINT32 *iso,
+	BOOL *isoAuto)
+{
+	*exposure100ns = 0;
+	*iso = 0;
+	*exposureAuto = TRUE;
+	*isoAuto = TRUE;
+	ComPtr<WMD::IVideoDeviceController> videoController;
+	ComPtr<WMD::IAdvancedVideoCaptureDeviceController2> advanced;
+	if (FAILED(capture->get_VideoDeviceController(&videoController)) || FAILED(videoController.As(&advanced))) return;
+
+	ComPtr<WMD::IExposureControl> exposure;
+	boolean supported = false;
+	if (SUCCEEDED(advanced->get_ExposureControl(&exposure)) && SUCCEEDED(exposure->get_Supported(&supported)) && supported)
+	{
+		boolean isAuto = true;
+		WF::TimeSpan value = {}, minimum = {};
+		exposure->get_Auto(&isAuto);
+		exposure->get_Value(&value);
+		exposure->get_Min(&minimum);
+		*exposureAuto = isAuto;
+		if (!isAuto) *exposure100ns = value.Duration;
+		if (verbose) printf("  exposure read back: %s, %.3f ms\n", isAuto ? "auto" : "manual", value.Duration / 10000.0);
+	}
+
+	ComPtr<WMD::IIsoSpeedControl> isoControl;
+	supported = false;
+	if (SUCCEEDED(advanced->get_IsoSpeedControl(&isoControl)) && SUCCEEDED(isoControl->get_Supported(&supported)) && supported)
+	{
+		ComPtr<WMD::IIsoSpeedControl2> isoControl2;
+		if (SUCCEEDED(isoControl.As(&isoControl2)))
+		{
+			boolean isAuto = true;
+			UINT32 value = 0;
+			isoControl2->get_Auto(&isAuto);
+			isoControl2->get_Value(&value);
+			*isoAuto = isAuto;
+			// In auto mode the value is the last manual one (seen on the Lumia 520), not the one in use
+			if (!isAuto) *iso = value;
+			if (verbose) printf("  ISO read back: %s, %u\n", isAuto ? "auto" : "manual", value);
+		}
+		else
+		{
+			WMD::IsoSpeedPreset preset = WMD::IsoSpeedPreset_Auto;
+			isoControl->get_Preset(&preset);
+			*iso = IsoOfPreset(preset);
+			*isoAuto = (*iso == 0);
+		}
+	}
+}
+
+// Minimal EXIF (TIFF little-endian) writer
+enum { EXIF_SHORT = 3, EXIF_LONG = 4, EXIF_RATIONAL = 5, EXIF_ASCII = 2, EXIF_UNDEFINED = 7 };
+
+struct ExifEntry
+{
+	WORD tag;
+	WORD type;
+	DWORD count;
+	BYTE data[64];
+	DWORD size;
+};
+
+struct ExifIfd
+{
+	ExifEntry entries[24];
+	int count = 0;
+
+	ExifEntry *Add(WORD tag, WORD type, DWORD count, const void *data, DWORD size)
+	{
+		ExifEntry *e = &entries[this->count++];
+		e->tag = tag;
+		e->type = type;
+		e->count = count;
+		e->size = size;
+		memset(e->data, 0, sizeof(e->data));
+		memcpy(e->data, data, size);
+		return e;
+	}
+	void Short(WORD tag, WORD value) { Add(tag, EXIF_SHORT, 1, &value, 2); }
+	void Long(WORD tag, DWORD value) { Add(tag, EXIF_LONG, 1, &value, 4); }
+	void Rational(WORD tag, DWORD numerator, DWORD denominator)
+	{
+		DWORD value[2] = { numerator, denominator };
+		Add(tag, EXIF_RATIONAL, 1, value, 8);
+	}
+	void Ascii(WORD tag, const char *text)
+	{
+		char buffer[64];
+		strncpy_s(buffer, sizeof(buffer), text, _TRUNCATE);
+		DWORD length = (DWORD)strlen(buffer) + 1;
+		Add(tag, EXIF_ASCII, length, buffer, length);
+	}
+	void Undefined(WORD tag, const char *bytes4) { Add(tag, EXIF_UNDEFINED, 4, bytes4, 4); }
+
+	// The entries must be sorted by tag
+	void Sort()
+	{
+		for (int i = 1; i < count; i++)
+		{
+			for (int j = i; j > 0 && entries[j - 1].tag > entries[j].tag; j--)
+			{
+				ExifEntry t = entries[j];
+				entries[j] = entries[j - 1];
+				entries[j - 1] = t;
+			}
+		}
+	}
+	DWORD Size() const
+	{
+		DWORD size = 2 + 12 * count + 4;
+		for (int i = 0; i < count; i++)
+		{
+			if (entries[i].size > 4) size += (entries[i].size + 1) & ~1u;
+		}
+		return size;
+	}
+	// Writes the IFD at the TIFF offset 'offset' (out points to the start of the TIFF header)
+	void Write(BYTE *tiff, DWORD offset) const
+	{
+		BYTE *p = tiff + offset;
+		DWORD dataOffset = offset + 2 + 12 * count + 4;
+		*(WORD *)p = (WORD)count;
+		p += 2;
+		for (int i = 0; i < count; i++)
+		{
+			const ExifEntry &e = entries[i];
+			*(WORD *)p = e.tag;
+			*(WORD *)(p + 2) = e.type;
+			*(DWORD *)(p + 4) = e.count;
+			if (e.size <= 4)
+			{
+				memset(p + 8, 0, 4);
+				memcpy(p + 8, e.data, e.size);
+			}
+			else
+			{
+				*(DWORD *)(p + 8) = dataOffset;
+				memcpy(tiff + dataOffset, e.data, e.size);
+				if (e.size & 1) tiff[dataOffset + e.size] = 0;
+				dataOffset += (e.size + 1) & ~1u;
+			}
+			p += 12;
+		}
+		*(DWORD *)p = 0; // no next IFD
+	}
+};
+
+static void ReadRegistryString(const wchar_t *key, const wchar_t *value, char *out, size_t outSize, const char *fallback)
+{
+	strcpy_s(out, outSize, fallback);
+	HKEY hKey = NULL;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) return;
+	wchar_t buffer[64] = {};
+	DWORD type = 0, size = sizeof(buffer) - sizeof(wchar_t);
+	if (RegQueryValueExW(hKey, value, nullptr, &type, (BYTE *)buffer, &size) == ERROR_SUCCESS && type == 1 /* REG_SZ */ &&
+		buffer[0])
+	{
+		WideCharToMultiByte(CP_ACP, 0, buffer, -1, out, (int)outSize, nullptr, nullptr);
+	}
+	RegCloseKey(hKey);
+}
+
+// Builds the APP1 Exif segment (marker included) in 'segment', returns its size
+static DWORD BuildExifSegment(BYTE *segment, DWORD capacity, UINT32 width, UINT32 height, INT64 exposure100ns,
+	BOOL exposureAuto, UINT32 iso, BOOL isoAuto)
+{
+	char make[64], model[64], dateTime[20];
+	ReadRegistryString(L"System\\Platform\\DeviceTargetingInfo", L"PhoneManufacturer", make, sizeof(make), "Unknown");
+	ReadRegistryString(L"System\\Platform\\DeviceTargetingInfo", L"PhoneModelName", model, sizeof(model), "Windows Phone");
+	SYSTEMTIME now;
+	GetLocalTime(&now);
+	sprintf_s(dateTime, sizeof(dateTime), "%04u:%02u:%02u %02u:%02u:%02u", now.wYear, now.wMonth, now.wDay, now.wHour,
+		now.wMinute, now.wSecond);
+
+	ExifIfd ifd0, exif;
+	ifd0.Ascii(0x010F, make);
+	ifd0.Ascii(0x0110, model);
+	ifd0.Short(0x0112, 1);       // Orientation: top-left
+	ifd0.Rational(0x011A, 72, 1); // XResolution
+	ifd0.Rational(0x011B, 72, 1); // YResolution
+	ifd0.Short(0x0128, 2);       // ResolutionUnit: inch
+	ifd0.Ascii(0x0131, "wp81camdump");
+	ifd0.Ascii(0x0132, dateTime);
+	ifd0.Short(0x0213, 1);       // YCbCrPositioning: centered
+	ExifEntry *exifPointer = ifd0.Add(0x8769, EXIF_LONG, 1, "\0\0\0\0", 4);
+
+	if (exposure100ns > 0)
+	{
+		// 1/N when it is one (within 1%), else 100 ns units
+		double n = 10000000.0 / (double)exposure100ns;
+		DWORD rounded = (DWORD)(n + 0.5);
+		if (n >= 1.0 && rounded > 0 && fabs(n - rounded) / n < 0.01) exif.Rational(0x829A, 1, rounded);
+		else exif.Rational(0x829A, (DWORD)exposure100ns, 10000000);
+	}
+	BOOL manual = !exposureAuto || !isoAuto;
+	exif.Short(0x8822, manual ? 1 : 2); // ExposureProgram: manual / normal program
+	if (iso > 0)
+	{
+		exif.Short(0x8827, (WORD)(iso > 65535 ? 65535 : iso)); // ISOSpeedRatings
+		exif.Short(0x8830, 3);                                 // SensitivityType: ISO speed
+	}
+	exif.Undefined(0x9000, "0230"); // ExifVersion
+	exif.Ascii(0x9003, dateTime);   // DateTimeOriginal
+	exif.Ascii(0x9004, dateTime);   // DateTimeDigitized
+	exif.Undefined(0x9101, "\x01\x02\x03\x00"); // ComponentsConfiguration: YCbCr
+	exif.Undefined(0xA000, "0100"); // FlashpixVersion
+	exif.Short(0xA001, 1);          // ColorSpace: sRGB
+	exif.Long(0xA002, width);       // PixelXDimension
+	exif.Long(0xA003, height);      // PixelYDimension
+	exif.Short(0xA402, manual ? 1 : 0); // ExposureMode: manual / auto
+	ifd0.Sort();
+	exif.Sort();
+
+	DWORD ifd0Offset = 8;
+	DWORD exifOffset = ifd0Offset + ifd0.Size();
+	DWORD tiffSize = exifOffset + exif.Size();
+	DWORD segmentSize = 4 + 6 + tiffSize; // FFE1 + length + "Exif\0\0" + TIFF
+	if (segmentSize > capacity || segmentSize - 2 > 0xFFFF) return 0;
+	for (int i = 0; i < ifd0.count; i++)
+	{
+		if (ifd0.entries[i].tag == 0x8769) memcpy(ifd0.entries[i].data, &exifOffset, 4);
+	}
+	(void)exifPointer;
+
+	memset(segment, 0, segmentSize);
+	segment[0] = 0xFF;
+	segment[1] = 0xE1;
+	segment[2] = (BYTE)((segmentSize - 2) >> 8);
+	segment[3] = (BYTE)((segmentSize - 2) & 0xFF);
+	memcpy(segment + 4, "Exif\0\0", 6);
+	BYTE *tiff = segment + 10;
+	memcpy(tiff, "II\x2A\x00", 4);
+	*(DWORD *)(tiff + 4) = ifd0Offset;
+	ifd0.Write(tiff, ifd0Offset);
+	exif.Write(tiff, exifOffset);
+	return segmentSize;
+}
+
+// Inserts an EXIF segment in the JPEG written by the camera (which has only a JFIF header):
+// SOI, APP1 Exif, then the original segments without the JFIF APP0. Returns the new file size, 0 on failure.
+static UINT64 AddExifToJpeg(const wchar_t *path, UINT64 fileSize, UINT32 width, UINT32 height, INT64 exposure100ns,
+	BOOL exposureAuto, UINT32 iso, BOOL isoAuto)
+{
+	if (fileSize < 4 || fileSize > 64 * 1024 * 1024) return 0;
+	BYTE *jpeg = (BYTE *)malloc((size_t)fileSize);
+	if (!jpeg) return 0;
+	UINT64 result = 0;
+	HANDLE hFile = CreateFile2(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, NULL);
+	DWORD read = 0;
+	BOOL ok = hFile != INVALID_HANDLE_VALUE && ReadFile(hFile, jpeg, (DWORD)fileSize, &read, NULL) && read == fileSize;
+	if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+	if (ok && jpeg[0] == 0xFF && jpeg[1] == 0xD8)
+	{
+		// Skip the JFIF APP0 and an existing Exif APP1 right after SOI
+		DWORD rest = 2;
+		while (rest + 4 <= fileSize && jpeg[rest] == 0xFF && (jpeg[rest + 1] == 0xE0 || jpeg[rest + 1] == 0xE1))
+		{
+			rest += 2 + ((DWORD)jpeg[rest + 2] << 8 | jpeg[rest + 3]);
+		}
+		BYTE segment[2048];
+		DWORD segmentSize = BuildExifSegment(segment, sizeof(segment), width, height, exposure100ns, exposureAuto, iso, isoAuto);
+		if (segmentSize > 0 && rest < fileSize)
+		{
+			DWORD newSize = 2 + segmentSize + (DWORD)(fileSize - rest);
+			BYTE *out = (BYTE *)malloc(newSize);
+			if (out)
+			{
+				out[0] = 0xFF;
+				out[1] = 0xD8;
+				memcpy(out + 2, segment, segmentSize);
+				memcpy(out + 2 + segmentSize, jpeg + rest, (size_t)(fileSize - rest));
+				if (SUCCEEDED(WriteFileData(path, out, newSize))) result = newSize;
+				free(out);
+			}
+		}
+	}
+	free(jpeg);
+	if (result == 0) printf("Warning: cannot add the EXIF information to %ls\n", path);
+	return result;
 }
 
 static HRESULT StopPreview(WMC::IMediaCapture *capture)
@@ -1291,12 +2156,199 @@ static HRESULT CapturePhoto(WMC::IMediaCapture *capture, const wchar_t *outputPa
 		printf("The picture is empty\n");
 		return E_FAIL;
 	}
-	printf("Picture saved: %ls (%llu bytes)\n", outputPath, (unsigned long long)size);
+	// The resolution of the saved picture: the one of the photo stream
+	UINT32 width = 0, height = 0;
+	ComPtr<WMD::IVideoDeviceController> videoController;
+	ComPtr<WMD::IMediaDeviceController> controller;
+	ComPtr<WMP::IMediaEncodingProperties> photoProps;
+	if (SUCCEEDED(capture->get_VideoDeviceController(&videoController)) && SUCCEEDED(videoController.As(&controller)) &&
+		SUCCEEDED(controller->GetMediaStreamProperties(WMC::MediaStreamType_Photo, &photoProps)))
+	{
+		GetSize(photoProps.Get(), &width, &height);
+	}
+	// EXIF: resolution, exposure time, ISO, date, camera
+	INT64 exposure100ns = 0;
+	UINT32 iso = 0;
+	BOOL exposureAuto = TRUE, isoAuto = TRUE;
+	ReadExposureState(capture, &exposure100ns, &exposureAuto, &iso, &isoAuto);
+	UINT64 newSize = AddExifToJpeg(outputPath, size, width, height, exposure100ns, exposureAuto, iso, isoAuto);
+	if (newSize) size = newSize;
+	if (width && height) printf("Picture saved: %ls (%ux%u JPEG, %llu bytes)\n", outputPath, width, height, (unsigned long long)size);
+	else printf("Picture saved: %ls (%llu bytes)\n", outputPath, (unsigned long long)size);
 	return S_OK;
 }
 
-static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD previewDelayMs, BOOL largestResolution,
-	BOOL shutterSound, BOOL listFormats, BOOL raw, int rawStream, int rawType, int rawCount, BOOL growHeap)
+// Raw mode of the driver.
+// qccamavs8930.sys gives its raw data ranges to the still pin only when ManufacturingOS ManufacturingMode = 1.
+// It reads the value each time the camera filter is created, and keeps the last value it could read: when the
+// value is missing it stays in raw mode, and then MediaCapture can't initialize (0xC00D5212) until a reboot.
+// So -r sets the value, and afterwards writes back the original value (0 if there was none), opens the camera once
+// so that the driver reads it, and only then deletes what it created. The original state is saved next to the value
+// (wp81camdump.* values): if a run dies before the end, the next run of wp81camdump finishes the restore.
+#define MMOS_KEY L"Software\\Microsoft\\ManufacturingOS"
+#define MMOS_VALUE L"ManufacturingMode"
+#define MARKER_KEY_CREATED L"wp81camdump.KeyCreated"      // 1: the key didn't exist
+#define MARKER_ORIGINAL L"wp81camdump.OriginalValue"     // the original ManufacturingMode, absent if there was none
+#define MARKER_ACTIVE L"wp81camdump.RawModeActive"       // 1: raw mode set by wp81camdump, not restored yet
+
+static BOOL ReadDword(HKEY key, const wchar_t *name, DWORD *value)
+{
+	DWORD type = 0, size = sizeof(DWORD);
+	return RegQueryValueExW(key, name, nullptr, &type, (BYTE *)value, &size) == ERROR_SUCCESS && type == REG_DWORD;
+}
+
+static LONG WriteDword(HKEY key, const wchar_t *name, DWORD value)
+{
+	return RegSetValueExW(key, name, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+}
+
+// The maximum exposure the driver reports (and MFCaptureEngine accepts) is HKLM\...\RFC\Caps MaxET, in µs, read at each
+// camera open, 1 s by default. The real limit is 4 s (NokiaElfsPlugIn::Init caps it): sets MaxET to 4 s, permanently.
+#define CAMERA_CAPS_KEY L"Software\\OEM\\Nokia\\Camera\\RFC\\Caps"
+#define MAX_EXPOSURE_US 4000000
+static void EnsureMaxExposure()
+{
+	HKEY key = NULL;
+	LONG err = RegCreateKeyExW(HKEY_LOCAL_MACHINE, CAMERA_CAPS_KEY, 0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr,
+		&key, nullptr);
+	if (err != ERROR_SUCCESS)
+	{
+		printf("Warning: cannot open HKLM\\%ls (error %ld): the maximum exposure stays at the driver default\n",
+			CAMERA_CAPS_KEY, err);
+		return;
+	}
+	DWORD current = 0;
+	BOOL present = ReadDword(key, L"MaxET", &current);
+	if (!present || current != MAX_EXPOSURE_US)
+	{
+		err = WriteDword(key, L"MaxET", MAX_EXPOSURE_US);
+		if (err == ERROR_SUCCESS)
+		{
+			printf("Set HKLM\\%ls MaxET = %u (maximum exposure 4 s, was %s)\n", CAMERA_CAPS_KEY, MAX_EXPOSURE_US,
+				present ? "another value" : "the 1 s default");
+		}
+		else
+		{
+			printf("Warning: cannot set HKLM\\%ls MaxET (error %ld)\n", CAMERA_CAPS_KEY, err);
+		}
+	}
+	else if (verbose)
+	{
+		printf("HKLM\\%ls MaxET = %lu\n", CAMERA_CAPS_KEY, current);
+	}
+	RegCloseKey(key);
+}
+
+// Opens the camera once (filter created → the driver reads ManufacturingMode) and closes it.
+// Returns whether the still pin offers raw types (TRUE = the driver is in raw mode).
+static BOOL OpenCameraOnce(BOOL *rawExposed)
+{
+	*rawExposed = FALSE;
+	HookCaptureEngine(); // to look at the native types through the engine
+	ComPtr<WMC::IMediaCapture> capture;
+	ComPtr<WMC::IMediaCaptureInitializationSettings> settings;
+	if (FAILED(ActivateInstance(WINDOWS_MEDIA_DLL, RuntimeClass_Windows_Media_Capture_MediaCapture,
+		__uuidof(WMC::IMediaCapture), (void **)capture.GetAddressOf()))) return FALSE;
+	if (FAILED(ActivateInstance(WINDOWS_MEDIA_DLL, RuntimeClass_Windows_Media_Capture_MediaCaptureInitializationSettings,
+		__uuidof(WMC::IMediaCaptureInitializationSettings), (void **)settings.GetAddressOf()))) return FALSE;
+	settings->put_StreamingCaptureMode(WMC::StreamingCaptureMode_Video);
+	ComPtr<WF::IAsyncAction> action;
+	HRESULT hr = capture->InitializeWithSettingsAsync(settings.Get(), &action);
+	if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "InitializeWithSettingsAsync");
+	if (verbose) printf("Camera opened to reset the driver: 0x%08lX\n", (unsigned long)hr);
+	if (SUCCEEDED(hr))
+	{
+		int s, t;
+		*rawExposed = FindLargestIdealRawType(&s, &t);
+	}
+	ComPtr<WF::IClosable> closable;
+	if (SUCCEEDED(capture.As(&closable))) closable->Close();
+	return SUCCEEDED(hr);
+}
+
+// Sets ManufacturingMode = 1 for the raw capture, after saving the original state.
+static HRESULT EnterRawMode()
+{
+	HKEY key = NULL;
+	DWORD disposition = 0;
+	LONG err = RegCreateKeyExW(HKEY_LOCAL_MACHINE, MMOS_KEY, 0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr,
+		&key, &disposition);
+	if (err != ERROR_SUCCESS)
+	{
+		printf("Cannot open HKLM\\%ls: error %ld\n", MMOS_KEY, err);
+		return HRESULT_FROM_WIN32(err);
+	}
+	DWORD active = 0;
+	if (!ReadDword(key, MARKER_ACTIVE, &active) || active != 1)
+	{
+		// Save the original state (not when a previous run wasn't restored: it's already saved)
+		WriteDword(key, MARKER_KEY_CREATED, disposition == REG_CREATED_NEW_KEY ? 1 : 0);
+		DWORD original = 0;
+		if (ReadDword(key, MMOS_VALUE, &original)) WriteDword(key, MARKER_ORIGINAL, original);
+		else RegDeleteValueW(key, MARKER_ORIGINAL);
+		WriteDword(key, MARKER_ACTIVE, 1);
+	}
+	err = WriteDword(key, MMOS_VALUE, 1);
+	RegCloseKey(key);
+	if (err != ERROR_SUCCESS)
+	{
+		printf("Cannot set ManufacturingMode: error %ld\n", err);
+		return HRESULT_FROM_WIN32(err);
+	}
+	if (verbose) printf("Raw mode: HKLM\\%ls %ls = 1\n", MMOS_KEY, MMOS_VALUE);
+	return S_OK;
+}
+
+// Restores the original state saved by EnterRawMode, if raw mode is active. Called after the raw capture,
+// and at the start of every run (cleanup after a run that died).
+static void LeaveRawMode(BOOL atStart)
+{
+	HKEY key = NULL;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, MMOS_KEY, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key) != ERROR_SUCCESS) return;
+	DWORD active = 0;
+	if (!ReadDword(key, MARKER_ACTIVE, &active) || active != 1)
+	{
+		RegCloseKey(key);
+		return;
+	}
+	if (atStart) printf("Restoring the camera driver after a raw capture that didn't finish\n");
+
+	DWORD keyCreated = 0, original = 0;
+	ReadDword(key, MARKER_KEY_CREATED, &keyCreated);
+	BOOL hadValue = ReadDword(key, MARKER_ORIGINAL, &original);
+
+	// The driver must read a value: write the original one, or 0, then open the camera
+	WriteDword(key, MMOS_VALUE, hadValue ? original : 0);
+	BOOL rawExposed = FALSE;
+	BOOL opened = FALSE;
+	for (int attempt = 0; attempt < 5 && !opened; attempt++)
+	{
+		if (attempt > 0) Sleep(1000);
+		opened = OpenCameraOnce(&rawExposed);
+	}
+	BOOL expectRaw = hadValue && original == 1;
+	if (!opened || rawExposed != expectRaw)
+	{
+		// Keep the markers: the next run tries again
+		printf("Warning: the camera driver may still be in raw mode (camera opened: %s). Run wp81camdump again, or reboot\n",
+			opened ? "yes" : "no");
+		RegCloseKey(key);
+		return;
+	}
+
+	// The driver has read the original value: remove what was created
+	RegDeleteValueW(key, MARKER_ACTIVE);
+	RegDeleteValueW(key, MARKER_ORIGINAL);
+	RegDeleteValueW(key, MARKER_KEY_CREATED);
+	if (!hadValue) RegDeleteValueW(key, MMOS_VALUE);
+	RegCloseKey(key);
+	if (keyCreated) RegDeleteKeyExW(HKEY_LOCAL_MACHINE, MMOS_KEY, 0, 0); // fails if something else was added to it
+	if (verbose) printf("Raw mode left, registry restored\n");
+}
+
+static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD previewDelayMs,
+	BOOL shutterSound, BOOL listFormats, BOOL raw, int rawCount, BOOL growHeap,
+	int iso, INT64 exposure100ns, UINT32 photoWidth, UINT32 photoHeight)
 {
 	// Before the initialization of MediaCapture, which creates and initializes the capture engine
 	muteShutter = !shutterSound;
@@ -1340,7 +2392,9 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 
 	if (listFormats)
 	{
-		hr = ListNativeFormats();
+		if (raw) hr = ListRawResolutions();
+		else PrintPhotoResolutions(capture.Get());
+		if (verbose) ListNativeFormats();
 		ComPtr<WF::IClosable> closable;
 		if (SUCCEEDED(capture.As(&closable))) closable->Close();
 		return hr;
@@ -1353,18 +2407,57 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 	hr = videoController.As(&controller);
 	CHECK(hr, "QueryInterface(IMediaDeviceController)");
 
-	if (largestResolution)
+	// With -r, -s is the raw resolution
+	int rawStream = -1, rawType = -1;
+	if (raw && photoWidth != 0)
+	{
+		ComPtr<IMFCaptureSource_> source;
+		if (capturedEngine == nullptr || FAILED(capturedEngine->GetSource(&source)) ||
+			!FindRawTypeBySize(source.Get(), photoWidth, photoHeight, &rawStream, &rawType))
+		{
+			printf("No raw resolution %ux%u (wp81camdump -r -l lists them)\n", photoWidth, photoHeight);
+			ComPtr<WF::IClosable> closable;
+			if (SUCCEEDED(capture.As(&closable))) closable->Close();
+			return MF_E_INVALIDMEDIATYPE;
+		}
+	}
+
+	if (photoWidth != 0 && !raw)
+	{
+		// Requested with -s: fatal if the camera doesn't have it
+		hr = SelectLargestResolution(controller.Get(), WMC::MediaStreamType_Photo, "Photo", 0, 0, nullptr, nullptr,
+			photoWidth, photoHeight);
+		if (FAILED(hr))
+		{
+			ComPtr<WF::IClosable> closable;
+			if (SUCCEEDED(capture.As(&closable))) closable->Close();
+			return hr;
+		}
+	}
+	else
 	{
 		// Not fatal: the default resolution is used if it fails
 		SelectLargestResolution(controller.Get(), WMC::MediaStreamType_Photo, "Photo", 0, 0, nullptr, nullptr);
 	}
 
 	BOOL previewStarted = FALSE;
-	if (usePreview)
+	// With -r, -e/-i go to the sensor itself (ApplyRawExposure), not to the 3A controls
+	if (raw)
+	{
+		iso = -1;
+		exposure100ns = -1;
+	}
+	if (!usePreview)
+	{
+		ApplyManualExposure(videoController.Get(), iso, exposure100ns);
+	}
+	else
 	{
 		hr = StartPreview(capture.Get(), controller.Get());
 		if (FAILED(hr)) return hr;
 		previewStarted = TRUE;
+		// While the camera streams (the controls may be refused otherwise); the rest of 3A settles during the delay
+		ApplyManualExposure(videoController.Get(), iso, exposure100ns);
 		if (verbose) printf("Waiting %lu ms\n", previewDelayMs);
 		Sleep(previewDelayMs);
 	}
@@ -1401,6 +2494,13 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 	else
 	{
 		hr = raw ? CaptureRawPhoto(outputPath, rawStream, rawType) : CapturePhoto(capture.Get(), outputPath);
+	}
+
+	// Back to auto before the camera is released: the driver keeps the manual values in the next sessions
+	if (iso > 0 || exposure100ns > 0)
+	{
+		if (verbose) printf("Restoring auto exposure/ISO\n");
+		ApplyManualExposure(videoController.Get(), iso > 0 ? 0 : -1, exposure100ns > 0 ? 0 : -1, TRUE);
 	}
 
 	if (previewStarted)
@@ -1462,6 +2562,45 @@ static LONG CALLBACK CrashReporter(EXCEPTION_POINTERS *info)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// -i: "auto" -> 0, or a positive integer
+static BOOL ParseIso(const char *text, int *iso)
+{
+	if (_stricmp(text, "auto") == 0)
+	{
+		*iso = 0;
+		return TRUE;
+	}
+	char *end = nullptr;
+	long value = strtol(text, &end, 10);
+	if (end == text || *end != '\0' || value <= 0 || value > 1000000) return FALSE;
+	*iso = (int)value;
+	return TRUE;
+}
+
+// -e: "auto" -> 0, "1/125" or "0.5" seconds -> 100 ns units
+static BOOL ParseExposure(const char *text, INT64 *exposure100ns)
+{
+	if (_stricmp(text, "auto") == 0)
+	{
+		*exposure100ns = 0;
+		return TRUE;
+	}
+	char *end = nullptr;
+	double seconds = strtod(text, &end);
+	if (end == text) return FALSE;
+	if (*end == '/')
+	{
+		const char *denominatorText = end + 1;
+		double denominator = strtod(denominatorText, &end);
+		if (end == denominatorText || denominator <= 0) return FALSE;
+		seconds /= denominator;
+	}
+	if (*end != '\0' || seconds <= 0 || seconds > 3600) return FALSE;
+	*exposure100ns = (INT64)(seconds * 10000000.0 + 0.5);
+	if (*exposure100ns < 1) *exposure100ns = 1;
+	return TRUE;
+}
+
 int main(int argc, char *argv[])
 {
 	AddVectoredExceptionHandler(1, CrashReporter);
@@ -1471,14 +2610,15 @@ int main(int argc, char *argv[])
 
 	const char *output = nullptr;
 	BOOL usePreview = TRUE;
-	BOOL largestResolution = TRUE;
 	DWORD previewDelayMs = 2000;
 	BOOL shutterSound = FALSE;
 	BOOL listFormats = FALSE;
 	BOOL raw = FALSE;
-	int rawStream = -1, rawType = -1;
 	int rawCount = 1;
 	BOOL growHeap = FALSE;
+	int iso = -1;              // -1: unchanged, 0: auto
+	INT64 exposure100ns = -1;  // -1: unchanged, 0: auto
+	UINT32 photoWidth = 0, photoHeight = 0; // 0: the largest
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -1498,10 +2638,6 @@ int main(int argc, char *argv[])
 		else if (strcmp(argv[i], "-p") == 0)
 		{
 			usePreview = TRUE; // default, kept for compatibility
-		}
-		else if (strcmp(argv[i], "-s") == 0)
-		{
-			largestResolution = FALSE;
 		}
 		else if (strcmp(argv[i], "-a") == 0)
 		{
@@ -1523,12 +2659,29 @@ int main(int argc, char *argv[])
 		else if (strcmp(argv[i], "-r") == 0)
 		{
 			raw = TRUE;
+			rawCaptureMode = TRUE;
 		}
-		else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+		else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
 		{
-			if (sscanf_s(argv[++i], "%d:%d", &rawStream, &rawType) != 2 || rawStream < 0 || rawType < 0)
+			if (sscanf_s(argv[++i], "%ux%u", &photoWidth, &photoHeight) != 2 || photoWidth == 0 || photoHeight == 0)
 			{
-				printf("Invalid -t %s (expected <stream>:<type>)\n", argv[i]);
+				printf("Invalid -s %s (expected <width>x<height>, e.g. 2048x1536)\n", argv[i]);
+				return EXIT_FAILURE;
+			}
+		}
+		else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc)
+		{
+			if (!ParseIso(argv[++i], &iso))
+			{
+				printf("Invalid -i %s (expected a number like 100, or auto)\n", argv[i]);
+				return EXIT_FAILURE;
+			}
+		}
+		else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc)
+		{
+			if (!ParseExposure(argv[++i], &exposure100ns))
+			{
+				printf("Invalid -e %s (expected seconds like 1/125 or 0.5, or auto)\n", argv[i]);
 				return EXIT_FAILURE;
 			}
 		}
@@ -1564,9 +2717,30 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	hr = TakePicture(outputPath, usePreview, previewDelayMs, largestResolution, shutterSound, listFormats,
-		raw, rawStream, rawType, rawCount, growHeap);
+	// A previous raw capture that died left the driver in raw mode: restore it first
+	LeaveRawMode(TRUE);
+
+	// Manual exposure: before the camera opens (the driver reads MaxET then)
+	if (exposure100ns > 0 && !raw) EnsureMaxExposure();
+	if (raw)
+	{
+		if (exposure100ns > 0) rawExposureUs = (DWORD)((exposure100ns + 5) / 10);
+		if (iso > 0) rawGainQ8 = (DWORD)(((UINT64)iso * 256 + 50) / 100);
+	}
+
+	if (raw)
+	{
+		hr = EnterRawMode();
+		if (FAILED(hr))
+		{
+			RoUninitialize();
+			return EXIT_FAILURE;
+		}
+	}
+	hr = TakePicture(outputPath, usePreview, previewDelayMs, shutterSound, listFormats,
+		raw, rawCount, growHeap, iso, exposure100ns, photoWidth, photoHeight);
 	pendingRawType.Reset();
+	if (raw) LeaveRawMode(FALSE);
 
 	RoUninitialize();
 	return SUCCEEDED(hr) ? EXIT_SUCCESS : EXIT_FAILURE;
