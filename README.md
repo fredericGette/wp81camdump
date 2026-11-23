@@ -28,11 +28,35 @@ wp81camdump [options] [output.jpg]
   -i <iso>   ISO speed: 100, 800, ... or auto (default: auto)
              With -r, -e and -i are written to the sensor itself: exposure, and analog gain = ISO / 100
              (the .txt gives the values read back from the sensor)
+             The raw still is then taken without a preview (no auto exposure), so not with -f (lens doesn't move)
+             -e alone uses ISO 100, -i alone 1/15 s
+  -f <pos>   Focus: a lens position, 0..1000 on the Lumia 520, the higher the farther (800: ~40 cm,
+             900..1000: a few meters), or inf (the maximum), near (the minimum), auto (default: auto)
+  -w <wb>    White balance: a color temperature in Kelvin (5500, 3200K, ...), or auto, daylight, cloudy,
+             tungsten, fluorescent, flash, candlelight (default: auto). No effect on -r (raw is unprocessed)
 ```
 
 Default output: `C:\Data\Users\Public\Documents\camdump.jpg`, or `camdump.raw` with `-r` (the shared folder, visible from the PC over USB).
 
 The application uses the WinRT `MediaCapture` API without app identity. A preview runs before the picture so that the auto exposure and focus can settle. The shutter sound is muted, and an EXIF header is added to the JPEG. The details are in the comments of `wp81camdump/src/wp81camdump.cpp`.
+
+## Manual focus (`-f`)
+
+`-f` sets the lens position through `FocusControl` (manual focus mode) once the preview runs, and puts the auto focus back before the camera is closed. The unit is the driver's own: 0..1000 on the Lumia 520, where a higher value focuses farther. Positions below about 500 are closer than anything can be sharp. Things around 40 cm are sharp near 800, and a wall a few meters away at 900..1000. `inf` and `near` are the two ends of the range. The driver says it supports the "infinity" and "hyperfocal" distances of `FocusSettings`, but ignores them. `-v` prints what the focus control offers. `-f` also works with `-r`, but not together with `-e`/`-i`: in manufacturing mode the auto exposure keeps running on the preview and overwrites the sensor values, so `-r -e/-i` takes the still without a preview, and without a preview the driver doesn't move the lens (it accepts the position, but ignores it).
+
+```
+wp81camdump.exe -f inf
+wp81camdump.exe -f 800 -e 1/30 -i 400
+```
+
+## White balance (`-w`)
+
+`-w` sets a white balance preset through `WhiteBalanceControl` once the preview runs, and puts auto back before the camera is closed. On the Lumia 520 the presets work: tungsten, fluorescent, daylight and cloudy give clearly different colors (candlelight looks the same as tungsten). The driver has no real color temperature range, though: it reports 5000 .. 5000 K, and it accepts other values but ignores them. So a temperature such as `-w 2800` is mapped to the nearest preset (< 2400 K candlelight, < 3400 K tungsten, < 4700 K fluorescent, < 6000 K daylight, else cloudy). On a driver with a real range, the temperature is set as given. `-v` prints the range.
+
+```
+wp81camdump.exe -w tungsten
+wp81camdump.exe -w 5500 -f 800
+```
 
 ## Raw Bayer frames (`-r`)
 

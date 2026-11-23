@@ -32,6 +32,8 @@ static DWORD asyncTimeoutMs = 30000;
 static Win32Api win32Api;
 static BOOL verbose = FALSE;
 static BOOL rawCaptureMode = FALSE; // -r
+// Size of the saved JPEG when it differs from the photo stream (the encoder scales it), 0: the size of the stream
+static UINT32 jpegWidth = 0, jpegHeight = 0;
 // Exposure time and ISO applied, read back from the controls (for the .txt of a raw still); 0 = auto/unknown
 static INT64 appliedExposure100ns = 0;
 static UINT32 appliedIso = 0;
@@ -83,6 +85,12 @@ static void PrintUsage()
 	printf("  -i <iso>   ISO speed: 100, 800, ... or auto (default: auto)\n");
 	printf("             With -r, -e and -i are written to the sensor itself: exposure, and analog gain = ISO / 100\n");
 	printf("             (the .txt gives the values read back from the sensor)\n");
+	printf("             The raw still is then taken without a preview (no auto exposure), so not with -f (lens doesn't move)\n");
+	printf("             -e alone uses ISO 100, -i alone 1/15 s\n");
+	printf("  -f <pos>   Focus: a lens position, 0..1000 on the Lumia 520, the higher the farther (800: ~40 cm,\n");
+	printf("             900..1000: a few meters), or inf (the maximum), near (the minimum), auto (default: auto)\n");
+	printf("  -w <wb>    White balance: a color temperature in Kelvin (5500, 3200K, ...), or auto, daylight, cloudy,\n");
+	printf("             tungsten, fluorescent, flash, candlelight (default: auto). No effect on -r (raw is unprocessed)\n");
 	printf("Default output: %s (%s with -r)\n", DEFAULT_OUTPUT, DEFAULT_RAW_OUTPUT);
 }
 
@@ -1104,6 +1112,9 @@ static void ApplyRawExposure()
 	{
 		if (rawExposureUs != 0) exposureUs = rawExposureUs;
 		if (rawGainQ8 != 0) gainQ8 = rawGainQ8;
+		// -e or -i alone: there is no preview (see main), so the 3A never set the other one (it reads 0)
+		if (exposureUs == 0) exposureUs = 66667; // 1/15 s
+		if (gainQ8 == 0) gainQ8 = 256;           // 1x, ISO 100
 		hr = SensorGainAndExposure(TRUE, &exposureUs, &gainQ8);
 		if (FAILED(hr)) printf("Warning: cannot set the sensor exposure/gain 0x%08lX\n", (unsigned long)hr);
 		// The frame being exposed still has the old values: wait for one with the new ones
@@ -1112,7 +1123,14 @@ static void ApplyRawExposure()
 		Sleep(waitMs);
 		asyncTimeoutMs = 30000 + exposureUs / 1000 * 4;
 		if (FAILED(SensorGainAndExposure(FALSE, &exposureUs, &gainQ8))) exposureUs = gainQ8 = 0;
-		if (rawExposureUs != 0 && exposureUs != 0 && exposureUs < rawExposureUs - rawExposureUs / 100)
+		BOOL exposureShort = rawExposureUs != 0 && exposureUs != 0 && exposureUs < rawExposureUs - rawExposureUs / 100;
+		BOOL exposureCapped = exposureShort && exposureUs >= 6300000; // near the 65535-line limit below
+		BOOL gainChanged = rawGainQ8 != 0 && gainQ8 != 0 && gainQ8 != (rawGainQ8 > 0xFFFF ? 0xFFFF : rawGainQ8);
+		if ((exposureShort && !exposureCapped) || gainChanged)
+		{
+			printf("Warning: the sensor didn't keep the requested values (the auto exposure may have rewritten them)\n");
+		}
+		if (exposureCapped)
 		{
 			// qccamsensor8930.sys converts the µs into sensor lines and caps them to 0xFFFF (16-bit coarse
 			// integration register): 65535 lines of 98.09 µs = 6.43 s on the Lumia 520
@@ -1826,6 +1844,351 @@ static void ApplyManualExposure(WMD::IVideoDeviceController *videoController, in
 	}
 }
 
+// -f: what to do with the focus
+enum FocusRequest { FOCUS_UNCHANGED = -1, FOCUS_AUTO = 0, FOCUS_VALUE, FOCUS_INFINITY, FOCUS_NEAREST };
+static const char *focusRequestNames[] = { "auto", "value", "infinity", "nearest" };
+
+// A boxed value (IReference<T>) for the optional fields of FocusSettings (the process has no WRL RuntimeClass)
+template <typename T> class BoxedValue : public WF::IReference<T>
+{
+	LONG refs = 1;
+	T value;
+public:
+	explicit BoxedValue(T v) : value(v) {}
+	STDMETHODIMP QueryInterface(REFIID iid, void **ppv) override
+	{
+		if (iid == __uuidof(IUnknown) || iid == __uuidof(IInspectable) || iid == __uuidof(WF::IReference<T>))
+		{
+			*ppv = static_cast<WF::IReference<T> *>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = nullptr;
+		return E_NOINTERFACE;
+	}
+	STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refs); }
+	STDMETHODIMP_(ULONG) Release() override
+	{
+		LONG n = InterlockedDecrement(&refs);
+		if (n == 0) delete this;
+		return n;
+	}
+	STDMETHODIMP GetIids(ULONG *count, IID **iids) override
+	{
+		*count = 0;
+		*iids = nullptr;
+		return S_OK;
+	}
+	STDMETHODIMP GetRuntimeClassName(HSTRING *name) override { *name = nullptr; return S_OK; }
+	STDMETHODIMP GetTrustLevel(TrustLevel *level) override { *level = BaseTrust; return S_OK; }
+	STDMETHODIMP get_Value(T *v) override { *v = value; return S_OK; }
+};
+
+static const char *FocusModeName(WMD::FocusMode mode)
+{
+	switch (mode)
+	{
+	case WMD::FocusMode_Auto: return "auto";
+	case WMD::FocusMode_Single: return "single";
+	case WMD::FocusMode_Continuous: return "continuous";
+	case WMD::FocusMode_Manual: return "manual";
+	default: return "?";
+	}
+}
+
+static const char *FocusDistanceName(WMD::ManualFocusDistance distance)
+{
+	switch (distance)
+	{
+	case WMD::ManualFocusDistance_Infinity: return "infinity";
+	case WMD::ManualFocusDistance_Hyperfocal: return "hyperfocal";
+	case WMD::ManualFocusDistance_Nearest: return "nearest";
+	default: return "?";
+	}
+}
+
+// Prints what the focus control of the driver offers (-v, or when -f fails)
+static void PrintFocusCapabilities(WMD::IFocusControl *focus, WMD::IFocusControl2 *focus2)
+{
+	UINT32 minimum = 0, maximum = 0, step = 0, value = 0;
+	focus->get_Min(&minimum);
+	focus->get_Max(&maximum);
+	focus->get_Step(&step);
+	focus->get_Value(&value);
+	printf("  focus range: %u .. %u, step %u, current %u\n", minimum, maximum, step, value);
+	ComPtr<WFC::IVectorView<WMD::FocusPreset>> presets;
+	unsigned count = 0;
+	if (SUCCEEDED(focus->get_SupportedPresets(&presets)) && presets && SUCCEEDED(presets->get_Size(&count)))
+	{
+		printf("  focus presets:");
+		for (unsigned i = 0; i < count; i++)
+		{
+			WMD::FocusPreset preset;
+			if (SUCCEEDED(presets->GetAt(i, &preset))) printf(" %d", (int)preset);
+		}
+		printf(" (0 auto, 1 manual, 2 macro, 3 normal, 4 infinity, 5 hyperfocal)\n");
+	}
+	if (focus2 == nullptr) return;
+	ComPtr<WFC::IVectorView<WMD::FocusMode>> modes;
+	if (SUCCEEDED(focus2->get_SupportedFocusModes(&modes)) && modes && SUCCEEDED(modes->get_Size(&count)))
+	{
+		printf("  focus modes:");
+		for (unsigned i = 0; i < count; i++)
+		{
+			WMD::FocusMode mode;
+			if (SUCCEEDED(modes->GetAt(i, &mode))) printf(" %s", FocusModeName(mode));
+		}
+		printf("\n");
+	}
+	ComPtr<WFC::IVectorView<WMD::ManualFocusDistance>> distances;
+	if (SUCCEEDED(focus2->get_SupportedFocusDistances(&distances)) && distances && SUCCEEDED(distances->get_Size(&count)))
+	{
+		printf("  manual focus distances:");
+		for (unsigned i = 0; i < count; i++)
+		{
+			WMD::ManualFocusDistance distance;
+			if (SUCCEEDED(distances->GetAt(i, &distance))) printf(" %s", FocusDistanceName(distance));
+		}
+		printf("\n");
+	}
+	WMD::FocusMode mode = WMD::FocusMode_Auto;
+	WMD::MediaCaptureFocusState state = WMD::MediaCaptureFocusState_Uninitialized;
+	focus2->get_Mode(&mode);
+	focus2->get_FocusState(&state);
+	printf("  focus mode %s, state %d (0 uninitialized, 1 lost, 2 searching, 3 focused, 4 failed)\n",
+		FocusModeName(mode), (int)state);
+}
+
+static BOOL HasFocusMode(WMD::IFocusControl2 *focus2, WMD::FocusMode wanted)
+{
+	ComPtr<WFC::IVectorView<WMD::FocusMode>> modes;
+	unsigned count = 0;
+	if (FAILED(focus2->get_SupportedFocusModes(&modes)) || !modes || FAILED(modes->get_Size(&count))) return FALSE;
+	for (unsigned i = 0; i < count; i++)
+	{
+		WMD::FocusMode mode;
+		if (SUCCEEDED(modes->GetAt(i, &mode)) && mode == wanted) return TRUE;
+	}
+	return FALSE;
+}
+
+// Sets the focus: auto, or a lens position in the units of the driver (FocusControl Min..Max).
+// Uses FocusControl.Configure + FocusAsync (the Windows Phone 8.1 API) when the driver has a manual focus mode, else the
+// presets of Windows 8 (Manual + SetValueAsync). Failures are warnings: the picture is still taken.
+// Lumia 520 (tested 2026-11-23): positions 0..1000, the higher the farther. 0..500 are all far out of focus (closer than
+// anything gets sharp), a subject at ~40 cm is sharp at 800, a wall a few meters away at 900..1000. The auto focus
+// lands where the sharpest manual position is. The driver lists the distances infinity and hyperfocal and accepts
+// them, but ignores them (the lens stays at its rest position, 40): inf and near are the ends of the range instead.
+static void ApplyFocus(WMD::IVideoDeviceController *videoController, int request, UINT32 value, BOOL restoring = FALSE)
+{
+	if (request == FOCUS_UNCHANGED) return;
+	BOOL report = verbose || !restoring;
+
+	ComPtr<WMD::IAdvancedVideoCaptureDeviceController2> advanced;
+	ComPtr<WMD::IFocusControl> focus;
+	boolean supported = false;
+	HRESULT hr = videoController->QueryInterface(__uuidof(WMD::IAdvancedVideoCaptureDeviceController2),
+		(void **)advanced.GetAddressOf());
+	if (SUCCEEDED(hr)) hr = advanced->get_FocusControl(&focus);
+	if (SUCCEEDED(hr)) hr = focus->get_Supported(&supported);
+	if (FAILED(hr) || !supported)
+	{
+		printf("Warning: focus control not supported (0x%08lX)\n", (unsigned long)hr);
+		return;
+	}
+	ComPtr<WMD::IFocusControl2> focus2;
+	focus.As(&focus2);
+	if (verbose && !restoring) PrintFocusCapabilities(focus.Get(), focus2.Get());
+
+	UINT32 minimum = 0, maximum = 0;
+	focus->get_Min(&minimum);
+	focus->get_Max(&maximum);
+	int asked = request;
+	if (request == FOCUS_INFINITY || request == FOCUS_NEAREST)
+	{
+		value = request == FOCUS_INFINITY ? maximum : minimum;
+		request = FOCUS_VALUE;
+	}
+	if (request == FOCUS_VALUE)
+	{
+		UINT32 clamped = value;
+		if (clamped < minimum) clamped = minimum;
+		if (maximum > minimum && clamped > maximum) clamped = maximum;
+		if (clamped != value) printf("Warning: focus %u out of range, clamped to %u (range %u .. %u)\n", value, clamped,
+			minimum, maximum);
+		value = clamped;
+	}
+
+	ComPtr<WF::IAsyncAction> action;
+	BOOL useConfigure = focus2 && HasFocusMode(focus2.Get(), request == FOCUS_AUTO ? WMD::FocusMode_Continuous :
+		WMD::FocusMode_Manual);
+	if (useConfigure)
+	{
+		ComPtr<WMD::IFocusSettings> settings;
+		hr = ActivateInstance(WINDOWS_MEDIA_DLL, RuntimeClass_Windows_Media_Devices_FocusSettings,
+			__uuidof(WMD::IFocusSettings), (void **)settings.GetAddressOf());
+		if (SUCCEEDED(hr))
+		{
+			if (request == FOCUS_AUTO)
+			{
+				settings->put_Mode(WMD::FocusMode_Continuous);
+				settings->put_AutoFocusRange(WMD::AutoFocusRange_FullRange);
+			}
+			else
+			{
+				settings->put_Mode(WMD::FocusMode_Manual);
+				ComPtr<WF::IReference<UINT32>> boxed;
+				boxed.Attach(new BoxedValue<UINT32>(value));
+				settings->put_Value(boxed.Get());
+			}
+			hr = focus2->Configure(settings.Get());
+			if (verbose) printf("  FocusControl.Configure(%s): 0x%08lX\n", focusRequestNames[request], (unsigned long)hr);
+		}
+		// The lens moves (or the continuous search starts) with FocusAsync
+		if (SUCCEEDED(hr)) hr = focus->FocusAsync(&action);
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "FocusAsync");
+	}
+	else if (request == FOCUS_AUTO)
+	{
+		hr = focus->SetPresetAsync(WMD::FocusPreset_Auto, &action);
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "FocusControl.SetPresetAsync(Auto)");
+	}
+	else
+	{
+		hr = focus->SetPresetAsync(WMD::FocusPreset_Manual, &action);
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "FocusControl.SetPresetAsync(Manual)");
+		if (verbose) printf("  FocusControl.SetPresetAsync(Manual): 0x%08lX\n", (unsigned long)hr);
+		action.Reset();
+		hr = focus->SetValueAsync(value, &action);
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "FocusControl.SetValueAsync");
+	}
+	if (FAILED(hr))
+	{
+		printf("Warning: cannot set the focus to %s 0x%08lX\n", focusRequestNames[asked], (unsigned long)hr);
+		if (!verbose && !restoring) PrintFocusCapabilities(focus.Get(), focus2.Get());
+	}
+
+	UINT32 current = 0;
+	focus->get_Value(&current);
+	if (report)
+	{
+		if (request == FOCUS_AUTO) printf("Focus: auto\n");
+		else if (asked == FOCUS_VALUE) printf("Focus: lens position %u (range %u .. %u)\n", current, minimum, maximum);
+		else printf("Focus: %s, lens position %u (range %u .. %u)\n", focusRequestNames[asked], current, minimum,
+			maximum);
+	}
+}
+
+// -w: a preset (ColorTemperaturePreset), or WB_KELVIN for a color temperature
+static const int WB_UNCHANGED = -1;
+static const int WB_KELVIN = WMD::ColorTemperaturePreset_Manual;
+static const char *WhiteBalancePresetName(int preset)
+{
+	switch (preset)
+	{
+	case WMD::ColorTemperaturePreset_Auto: return "auto";
+	case WMD::ColorTemperaturePreset_Manual: return "manual";
+	case WMD::ColorTemperaturePreset_Cloudy: return "cloudy";
+	case WMD::ColorTemperaturePreset_Daylight: return "daylight";
+	case WMD::ColorTemperaturePreset_Flash: return "flash";
+	case WMD::ColorTemperaturePreset_Fluorescent: return "fluorescent";
+	case WMD::ColorTemperaturePreset_Tungsten: return "tungsten";
+	case WMD::ColorTemperaturePreset_Candlelight: return "candlelight";
+	default: return "?";
+	}
+}
+
+// The preset closest to a color temperature, for a driver without a usable temperature range
+static WMD::ColorTemperaturePreset NearestWhiteBalancePreset(UINT32 kelvin)
+{
+	if (kelvin < 2400) return WMD::ColorTemperaturePreset_Candlelight; // ~1900 K
+	if (kelvin < 3400) return WMD::ColorTemperaturePreset_Tungsten;    // ~2850 K
+	if (kelvin < 4700) return WMD::ColorTemperaturePreset_Fluorescent; // ~4000 K
+	if (kelvin < 6000) return WMD::ColorTemperaturePreset_Daylight;    // ~5500 K
+	return WMD::ColorTemperaturePreset_Cloudy;                         // ~6500 K
+}
+
+// Sets the white balance: a preset (auto, daylight, ...) or a color temperature in Kelvin (WB_KELVIN + kelvin).
+// Through WhiteBalanceControl: SetPresetAsync, or SetValueAsync for a temperature (which switches to the manual preset).
+// Lumia 520 (tested 2026-11-23): the presets work (tungsten/fluorescent/daylight/cloudy give clearly different colors),
+// but the temperature range is 5000 .. 5000 K, and SetValueAsync accepts any value and changes nothing (colors as in
+// auto). With such a range, a temperature is mapped to the nearest preset instead.
+static void ApplyWhiteBalance(WMD::IVideoDeviceController *videoController, int request, UINT32 kelvin,
+	BOOL restoring = FALSE)
+{
+	if (request == WB_UNCHANGED) return;
+	BOOL report = verbose || !restoring;
+
+	ComPtr<WMD::IAdvancedVideoCaptureDeviceController2> advanced;
+	ComPtr<WMD::IWhiteBalanceControl> wb;
+	boolean supported = false;
+	HRESULT hr = videoController->QueryInterface(__uuidof(WMD::IAdvancedVideoCaptureDeviceController2),
+		(void **)advanced.GetAddressOf());
+	if (SUCCEEDED(hr)) hr = advanced->get_WhiteBalanceControl(&wb);
+	if (SUCCEEDED(hr)) hr = wb->get_Supported(&supported);
+	if (FAILED(hr) || !supported)
+	{
+		printf("Warning: white balance control not supported (0x%08lX)\n", (unsigned long)hr);
+		return;
+	}
+
+	UINT32 minimum = 0, maximum = 0, step = 0, current = 0;
+	WMD::ColorTemperaturePreset preset = WMD::ColorTemperaturePreset_Auto;
+	wb->get_Min(&minimum);
+	wb->get_Max(&maximum);
+	wb->get_Step(&step);
+	if (verbose && !restoring)
+	{
+		wb->get_Value(&current);
+		wb->get_Preset(&preset);
+		printf("  white balance range: %u .. %u K, step %u, current %u K, preset %s\n", minimum, maximum, step, current,
+			WhiteBalancePresetName(preset));
+	}
+
+	if (request == WB_KELVIN && maximum <= minimum)
+	{
+		request = NearestWhiteBalancePreset(kelvin);
+		printf("The driver has no white balance temperature range (%u .. %u K): %u K -> preset %s\n", minimum, maximum,
+			kelvin, WhiteBalancePresetName(request));
+	}
+
+	ComPtr<WF::IAsyncAction> action;
+	if (request == WB_KELVIN)
+	{
+		UINT32 clamped = kelvin;
+		if (clamped < minimum) clamped = minimum;
+		if (maximum > minimum && clamped > maximum) clamped = maximum;
+		if (clamped != kelvin) printf("Warning: white balance %u K out of range, clamped to %u K (range %u .. %u)\n",
+			kelvin, clamped, minimum, maximum);
+		kelvin = clamped;
+		hr = wb->SetValueAsync(kelvin, &action);
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "WhiteBalanceControl.SetValueAsync");
+	}
+	else
+	{
+		hr = wb->SetPresetAsync((WMD::ColorTemperaturePreset)request, &action);
+		if (SUCCEEDED(hr)) hr = WaitAction(action.Get(), "WhiteBalanceControl.SetPresetAsync");
+	}
+	if (FAILED(hr))
+	{
+		if (request == WB_KELVIN) printf("Warning: cannot set the white balance to %u K 0x%08lX\n", kelvin, (unsigned long)hr);
+		else printf("Warning: cannot set the white balance to %s 0x%08lX\n", WhiteBalancePresetName(request),
+			(unsigned long)hr);
+		if (!verbose && !restoring) printf("  white balance range: %u .. %u K, step %u\n", minimum, maximum, step);
+	}
+
+	if (report)
+	{
+		current = 0;
+		preset = WMD::ColorTemperaturePreset_Auto;
+		wb->get_Value(&current);
+		wb->get_Preset(&preset);
+		if (preset == WMD::ColorTemperaturePreset_Auto) printf("White balance: auto\n");
+		else printf("White balance: %s, %u K (range %u .. %u)\n", WhiteBalancePresetName(preset), current, minimum,
+			maximum);
+	}
+}
+
 // Reads the current exposure time and ISO from the camera (for the EXIF of the JPEG).
 // 0 when unknown: in auto mode the Lumia 520 reports the minimum exposure and the last manual ISO, not the ones in use.
 static void ReadExposureState(WMC::IMediaCapture *capture, INT64 *exposure100ns, BOOL *exposureAuto, UINT32 *iso,
@@ -2135,6 +2498,13 @@ static HRESULT CapturePhoto(WMC::IMediaCapture *capture, const wchar_t *outputPa
 	ComPtr<WMP::IImageEncodingProperties> jpeg;
 	hr = imageStatics->CreateJpeg(&jpeg);
 	CHECK(hr, "ImageEncodingProperties::CreateJpeg");
+	if (jpegWidth != 0)
+	{
+		hr = jpeg->put_Width(jpegWidth);
+		CHECK(hr, "ImageEncodingProperties::put_Width");
+		hr = jpeg->put_Height(jpegHeight);
+		CHECK(hr, "ImageEncodingProperties::put_Height");
+	}
 
 	// CreateRandomAccessStreamOnFile only opens an existing file, and doesn't truncate it:
 	// create (or truncate) the file first.
@@ -2197,6 +2567,11 @@ static HRESULT CapturePhoto(WMC::IMediaCapture *capture, const wchar_t *outputPa
 		SUCCEEDED(controller->GetMediaStreamProperties(WMC::MediaStreamType_Photo, &photoProps)))
 	{
 		GetSize(photoProps.Get(), &width, &height);
+	}
+	if (jpegWidth != 0)
+	{
+		width = jpegWidth;
+		height = jpegHeight;
 	}
 	// EXIF: resolution, exposure time, ISO, date, camera
 	INT64 exposure100ns = 0;
@@ -2382,7 +2757,8 @@ static void LeaveRawMode(BOOL atStart)
 
 static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD previewDelayMs,
 	BOOL shutterSound, BOOL listFormats, BOOL raw, int rawCount, BOOL growHeap,
-	int iso, INT64 exposure100ns, UINT32 photoWidth, UINT32 photoHeight)
+	int iso, INT64 exposure100ns, int focus, UINT32 focusValue, int whiteBalance, UINT32 whiteBalanceKelvin,
+	UINT32 photoWidth, UINT32 photoHeight)
 {
 	// Before the initialization of MediaCapture, which creates and initializes the capture engine
 	muteShutter = !shutterSound;
@@ -2456,7 +2832,23 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 		}
 	}
 
-	if (photoWidth != 0 && !raw)
+	if (photoWidth == 640 && photoHeight == 480 && !raw)
+	{
+		// The 640x480 photo stream of the Lumia 520 driver comes out scrambled (horizontal stripes, the rows don't
+		// match the size of the frame): take the largest 4:3 stream and let the JPEG encoder scale it down.
+		hr = SelectLargestResolution(controller.Get(), WMC::MediaStreamType_Photo, "Photo", photoWidth, photoHeight,
+			nullptr, nullptr);
+		if (FAILED(hr))
+		{
+			ComPtr<WF::IClosable> closable;
+			if (SUCCEEDED(capture.As(&closable))) closable->Close();
+			return hr;
+		}
+		jpegWidth = photoWidth;
+		jpegHeight = photoHeight;
+		printf("Scaled to %ux%u (the 640x480 stream of the driver is scrambled)\n", jpegWidth, jpegHeight);
+	}
+	else if (photoWidth != 0 && !raw)
 	{
 		// Requested with -s: fatal if the camera doesn't have it
 		hr = SelectLargestResolution(controller.Get(), WMC::MediaStreamType_Photo, "Photo", 0, 0, nullptr, nullptr,
@@ -2484,6 +2876,8 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 	if (!usePreview)
 	{
 		ApplyManualExposure(videoController.Get(), iso, exposure100ns);
+		ApplyFocus(videoController.Get(), focus, focusValue);
+		ApplyWhiteBalance(videoController.Get(), whiteBalance, whiteBalanceKelvin);
 	}
 	else
 	{
@@ -2492,6 +2886,8 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 		previewStarted = TRUE;
 		// While the camera streams (the controls may be refused otherwise); the rest of 3A settles during the delay
 		ApplyManualExposure(videoController.Get(), iso, exposure100ns);
+		ApplyFocus(videoController.Get(), focus, focusValue);
+		ApplyWhiteBalance(videoController.Get(), whiteBalance, whiteBalanceKelvin);
 		if (verbose) printf("Waiting %lu ms\n", previewDelayMs);
 		Sleep(previewDelayMs);
 	}
@@ -2536,6 +2932,18 @@ static HRESULT TakePicture(const wchar_t *outputPath, BOOL usePreview, DWORD pre
 	{
 		if (verbose) printf("Restoring auto exposure/ISO\n");
 		ApplyManualExposure(videoController.Get(), iso > 0 ? 0 : -1, exposure100ns > 0 ? 0 : -1, TRUE);
+	}
+	// Same for the focus: the driver keeps its state between camera sessions
+	if (focus > FOCUS_AUTO)
+	{
+		if (verbose) printf("Restoring auto focus\n");
+		ApplyFocus(videoController.Get(), FOCUS_AUTO, 0, TRUE);
+	}
+	// And the white balance
+	if (whiteBalance > WMD::ColorTemperaturePreset_Auto)
+	{
+		if (verbose) printf("Restoring auto white balance\n");
+		ApplyWhiteBalance(videoController.Get(), WMD::ColorTemperaturePreset_Auto, 0, TRUE);
 	}
 
 	if (previewStarted)
@@ -2612,6 +3020,57 @@ static BOOL ParseIso(const char *text, int *iso)
 	return TRUE;
 }
 
+// -f: auto, inf, near, or a lens position (number)
+static BOOL ParseFocus(const char *text, int *focus, UINT32 *value)
+{
+	static const struct { const char *name; int request; } names[] = {
+		{ "auto", FOCUS_AUTO }, { "inf", FOCUS_INFINITY }, { "infinity", FOCUS_INFINITY },
+		{ "near", FOCUS_NEAREST }, { "nearest", FOCUS_NEAREST },
+	};
+	for (size_t i = 0; i < ARRAYSIZE(names); i++)
+	{
+		if (_stricmp(text, names[i].name) == 0)
+		{
+			*focus = names[i].request;
+			return TRUE;
+		}
+	}
+	char *end = nullptr;
+	unsigned long number = strtoul(text, &end, 10);
+	if (end == text || *end != '\0' || text[0] == '-') return FALSE;
+	*focus = FOCUS_VALUE;
+	*value = (UINT32)number;
+	return TRUE;
+}
+
+// -w: a preset name, or a color temperature in Kelvin (5500 or 5500K)
+static BOOL ParseWhiteBalance(const char *text, int *request, UINT32 *kelvin)
+{
+	static const struct { const char *name; int preset; } names[] = {
+		{ "auto", WMD::ColorTemperaturePreset_Auto }, { "cloudy", WMD::ColorTemperaturePreset_Cloudy },
+		{ "daylight", WMD::ColorTemperaturePreset_Daylight }, { "sunny", WMD::ColorTemperaturePreset_Daylight },
+		{ "flash", WMD::ColorTemperaturePreset_Flash }, { "fluorescent", WMD::ColorTemperaturePreset_Fluorescent },
+		{ "tungsten", WMD::ColorTemperaturePreset_Tungsten }, { "incandescent", WMD::ColorTemperaturePreset_Tungsten },
+		{ "candlelight", WMD::ColorTemperaturePreset_Candlelight }, { "candle", WMD::ColorTemperaturePreset_Candlelight },
+	};
+	for (size_t i = 0; i < ARRAYSIZE(names); i++)
+	{
+		if (_stricmp(text, names[i].name) == 0)
+		{
+			*request = names[i].preset;
+			return TRUE;
+		}
+	}
+	char *end = nullptr;
+	unsigned long number = strtoul(text, &end, 10);
+	if (end == text || text[0] == '-' || number == 0 || number > 100000) return FALSE;
+	if (*end == 'K' || *end == 'k') end++;
+	if (*end != '\0') return FALSE;
+	*request = WB_KELVIN;
+	*kelvin = (UINT32)number;
+	return TRUE;
+}
+
 // -e: "auto" -> 0, "1/125" or "0.5" seconds -> 100 ns units
 static BOOL ParseExposure(const char *text, INT64 *exposure100ns)
 {
@@ -2653,6 +3112,10 @@ int main(int argc, char *argv[])
 	BOOL growHeap = FALSE;
 	int iso = -1;              // -1: unchanged, 0: auto
 	INT64 exposure100ns = -1;  // -1: unchanged, 0: auto
+	int focus = FOCUS_UNCHANGED;
+	UINT32 focusValue = 0;     // with FOCUS_VALUE
+	int whiteBalance = WB_UNCHANGED;
+	UINT32 whiteBalanceKelvin = 0; // with WB_KELVIN
 	UINT32 photoWidth = 0, photoHeight = 0; // 0: the largest
 
 	for (int i = 1; i < argc; i++)
@@ -2720,6 +3183,23 @@ int main(int argc, char *argv[])
 				return EXIT_FAILURE;
 			}
 		}
+		else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc)
+		{
+			if (!ParseFocus(argv[++i], &focus, &focusValue))
+			{
+				printf("Invalid -f %s (expected a lens position like 800, or inf, near, auto)\n", argv[i]);
+				return EXIT_FAILURE;
+			}
+		}
+		else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc)
+		{
+			if (!ParseWhiteBalance(argv[++i], &whiteBalance, &whiteBalanceKelvin))
+			{
+				printf("Invalid -w %s (expected a temperature like 5500, or auto, daylight, cloudy, tungsten,"
+					" fluorescent, flash, candlelight)\n", argv[i]);
+				return EXIT_FAILURE;
+			}
+		}
 		else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc)
 		{
 			previewDelayMs = (DWORD)strtoul(argv[++i], NULL, 10);
@@ -2761,6 +3241,25 @@ int main(int argc, char *argv[])
 	{
 		if (exposure100ns > 0) rawExposureUs = (DWORD)((exposure100ns + 5) / 10);
 		if (iso > 0) rawGainQ8 = (DWORD)(((UINT64)iso * 256 + 50) / 100);
+		// In manufacturing mode the auto exposure keeps running on the preview (it ignores the 3A controls) and
+		// rewrites the sensor at each frame, so the values written by ApplyRawExposure are lost (seen: -e 0.5 -i 100 ->
+		// 59 ms at 8x; it only looked fine in a dark room, where the auto exposure was stuck at its maximum, 66 ms at 8x).
+		// Without a preview the 3A doesn't run and the sensor keeps them. Stopping the preview before the capture
+		// doesn't work: the diagnostic property then fails with 0x8007001F.
+		if (rawExposureUs != 0 || rawGainQ8 != 0)
+		{
+			// Without a preview the lens doesn't move: FocusControl accepts the position, but raws at 0 and 1000 are
+			// identical (with a preview they clearly differ), and restoring the auto focus times out (0x800705B4, 30 s)
+			if (focus > FOCUS_AUTO)
+			{
+				printf("-f cannot be combined with -r -e/-i: the raw still is then taken without a preview, and without\n");
+				printf("a preview the driver doesn't move the lens\n");
+				RoUninitialize();
+				return EXIT_FAILURE;
+			}
+			if (usePreview && verbose) printf("No preview with -r -e/-i: the auto exposure would overwrite the sensor values\n");
+			usePreview = FALSE;
+		}
 	}
 
 	if (raw)
@@ -2773,7 +3272,8 @@ int main(int argc, char *argv[])
 		}
 	}
 	hr = TakePicture(outputPath, usePreview, previewDelayMs, shutterSound, listFormats,
-		raw, rawCount, growHeap, iso, exposure100ns, photoWidth, photoHeight);
+		raw, rawCount, growHeap, iso, exposure100ns, focus, focusValue, whiteBalance, whiteBalanceKelvin,
+		photoWidth, photoHeight);
 	pendingRawType.Reset();
 	if (raw) LeaveRawMode(FALSE);
 
